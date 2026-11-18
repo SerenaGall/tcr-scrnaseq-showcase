@@ -1,0 +1,1136 @@
+---
+title: "Refined clustering and annotation"
+execute: 
+  echo: true
+  message: false
+  warning: false
+
+---
+
+```{r}
+#| label: setup
+#| message: false
+#| warning: false
+
+source("R/setup.R")
+source("R/helpers.R")
+```
+
+## Overview
+
+This section refines the provisional clustering identified in the annotation review step. The aim is to generate a more interpretable object for downstream repertoire, differential expression, pathway, and trajectory analyses by removing clear non-target populations, collapsing over-partitioned structure where appropriate, and assigning broader provisional state labels supported by marker-gene evidence.
+
+The refinement strategy was guided by three principles. First, clusters with strong evidence of non-target identity were excluded from the main T-cell-focused object. Second, clusters representing clearly recognisable functional programs, such as interferon-response, IL-17-like, and cycling states, were retained as explicit states. Third, clusters lacking strong independent biological support were grouped into broader provisional categories pending further review. Clusters lacking sufficiently specific marker support were grouped into an `Unresolved_state` category to retain those cells without over-interpreting their biological identity.
+
+```{r}
+#| label: load-provisional-object
+#| message: false
+#| warning: false
+
+obj <- readRDS("data/TCRseq_integrated_cluster_primary.rds")
+DefaultAssay(obj) <- "SCT"
+Idents(obj) <- "cluster_primary"
+```
+
+## Rationale for refinement
+
+The provisional clustering (Leiden, resolution 1.1) was deliberately granular to expose substructure. Many of those partitions do not have enough independent biological support to be read as distinct states, so related clusters were consolidated into broader state-level categories, using marker genes, the cluster's position in the UMAP and, as an independent check, the authors' deposited cell-type labels.
+
+Two provisional clusters were excluded as non-target populations. One expressed *Cd8a* and *Cd8b1* with almost no *Cd4* (CD8⁺ T cells). The other expressed *Zbtb16* (PLZF), *Klrb1c* (NK1.1), *Il4* and *Cd160*, the signature of invariant NKT cells, which are CD4⁺ in part but are not conventional or regulatory CD4⁺ T cells.
+
+Among the retained clusters, distinct programs supported explicit states:
+
+- **Naive-like**: *Sell*, *Lef1*, *Dapl1*, *Satb1*, *Igfbp4*. Four clusters were merged.
+- **Activated/memory-like**: *Tnfsf8*, *Tnfsf11*, *Fasl*, *Itgb1*, with low *Foxp3*.
+- **Th1/cytotoxic-like**: *Tbx21*, *Ifng*, *Ccl5*, *Nkg7*, *Cxcr6*.
+- **Th2/tissue-like**: *Gata3*, *Il1rl1* (ST2), *Arg1*, *Pparg*.
+- **IL-17-like**: *Rorc*, *Il23r*, *Il17re*, *Il1r1*.
+- **Treg resting-like**: *Foxp3*, *Il2ra*, *Ctla4*, *Izumo1r*, with high *Sell*.
+- **Treg tissue-like**: *Foxp3*, *Klrg1*, *Il1rl1*, *Areg*, *Tnfrsf9*, *Tnfrsf4*, *Itgae*.
+- **IFN-response**: *Ifit1*, *Ifit3*, *Isg15*, *Irf7*.
+- **Cycling**: *Mki67*, *Ccna2*, histone genes.
+
+Two clusters were kept as `Unresolved_state` and flagged (`low_quality_flag`). One had the lowest gene complexity and reduced *Cd3e*. The other was dominated by long, intron-rich transcripts (*Gphn*, *Lars2*, *Camk1d*, *Cdk8*), a pattern usually linked to nuclear or technical capture rather than a T-cell program. Key downstream results can be checked with and without these cells.
+
+## Define cluster actions
+
+Each provisional cluster gets one row in a single decision table, which drives both the relabelling and the report table below.
+
+```{r}
+#| label: define-cluster-actions
+
+cluster_decisions <- tibble::tribble(
+  ~cluster_primary, ~action,   ~revised_label,          ~rationale,
+  "1",  "retain", "Naive_like",            "Naive/resting (Lef1, Satb1, Igfbp4, Sell)",
+  "2",  "retain", "Naive_like",            "Naive/resting (Sell, Satb1, Ly6c1)",
+  "3",  "retain", "Naive_like",            "Naive/resting (Dapl1, Igfbp4, Sell)",
+  "4",  "retain", "Naive_like",            "Naive/resting (Dapl1, Il7r, Bcl2, Sell)",
+  "5",  "retain", "Treg_tissue_like",      "Tissue/effector Treg (Foxp3, Klrg1, Il1rl1, Areg, Tnfrsf9, Itgae)",
+  "6",  "retain", "Th1_cytotoxic_like",    "Th1/cytotoxic (Tbx21, Ifng, Ccl5, Nkg7, Cxcr6)",
+  "7",  "retain", "Naive_like",            "Naive-like with mild long-transcript signal (Dapl1, Igfbp4, Cdk8)",
+  "8",  "retain", "Activated_memory_like", "Activated/memory (Tnfsf8, Tnfsf11, Fasl, Itgb1; Foxp3 low)",
+  "9",  "retain", "Cycling",               "Proliferating (Mki67, Ccna2, histone genes)",
+  "10", "retain", "IFN_response",          "Interferon-stimulated genes (Ifit1, Ifit3, Isg15, Irf7)",
+  "11", "retain", "Treg_resting_like",     "Resting/central Treg (Foxp3, Il2ra, Ctla4, Izumo1r, Sell)",
+  "12", "retain", "Unresolved_state",      "Long intron-rich transcripts (Gphn, Lars2, Camk1d); likely technical",
+  "13", "retain", "Unresolved_state",      "Lowest gene complexity and reduced Cd3e; low quality",
+  "14", "retain", "IL17_like",             "Type-17 program (Rorc, Il23r, Il17re, Il1r1)",
+  "15", "retain", "Th2_tissue_like",       "Th2/tissue (Gata3, Il1rl1, Arg1, Pparg)",
+  "16", "remove", NA_character_,           "iNKT-like non-target cells (Zbtb16, Klrb1c, Il4, Cd160)",
+  "17", "remove", NA_character_,           "CD8 T cells (Cd8a, Cd8b1; Cd4 absent)"
+)
+
+low_quality_clusters <- c("12", "13")
+
+clusters_remove <- cluster_decisions$cluster_primary[cluster_decisions$action == "remove"]
+
+cluster_to_revised <- cluster_decisions %>%
+  dplyr::filter(action == "retain") %>%
+  dplyr::select(cluster_primary, revised_label) %>%
+  tibble::deframe()
+
+stopifnot(all(cluster_to_revised %in% state_levels_all))
+
+# Safeguard: fails loudly if the clustering ever changes
+stopifnot(setequal(
+  cluster_decisions$cluster_primary,
+  as.character(unique(obj$cluster_primary))
+))
+```
+
+```{r}
+#| label: tbl-refinement-decisions
+#| tbl-cap: "Refinement decisions applied to provisional clusters."
+
+cluster_sizes <- obj@meta.data %>%
+  dplyr::count(cluster_primary, name = "n_cells") %>%
+  dplyr::mutate(cluster_primary = as.character(cluster_primary))
+
+decision_table <- cluster_decisions %>%
+  dplyr::left_join(cluster_sizes, by = "cluster_primary") %>%
+  dplyr::relocate(n_cells, .after = cluster_primary) %>%
+  dplyr::arrange(as.numeric(cluster_primary))
+
+knitr::kable(decision_table)
+```
+
+```{r}
+#| label: subset-revised-object
+#| message: false
+#| warning: false
+
+obj_revised <- subset(
+  obj,
+  subset = !cluster_primary %in% clusters_remove
+)
+
+Idents(obj_revised) <- "cluster_primary"
+```
+
+```{r}
+#| label: fix-duplicate-cellnames
+#| message: false
+#| warning: false
+
+if (anyDuplicated(colnames(obj_revised)) > 0) {
+  new_names <- make.unique(colnames(obj_revised))
+  obj_revised <- RenameCells(obj_revised, new.names = new_names)
+}
+```
+
+The first refinement step removed clusters with strong evidence of non-target identity from the main revised object. This yielded a T-cell-focused analysis object while preserving the original provisional object unchanged for traceability and comparison.
+
+```{r}
+#| label: assign-revised-labels
+#| message: false
+#| warning: false
+
+obj_revised$cluster_revised <- dplyr::recode(
+  as.character(obj_revised$cluster_primary),
+  !!!cluster_to_revised,
+  .default = "Unassigned"
+)
+
+# Safeguard: stop if any cell was not mapped to a state
+stopifnot(!any(obj_revised$cluster_revised == "Unassigned"))
+
+obj_revised$cluster_revised <- factor(
+  obj_revised$cluster_revised,
+  levels = state_levels_all
+)
+
+# Flag technical clusters for the with/without sensitivity analysis
+obj_revised$low_quality_flag <- obj_revised$cluster_primary %in% low_quality_clusters
+
+Idents(obj_revised) <- "cluster_revised"
+```
+
+```{r}
+#| label: check-revised-state-counts
+#| include: false
+
+table(obj$cluster_primary, useNA = "ifany")
+table(obj_revised$cluster_primary, useNA = "ifany")
+table(obj_revised$cluster_revised, useNA = "ifany")
+```
+
+### Revised cluster overview
+
+```{r}
+#| label: define-revised-cluster-colors
+#| message: false
+#| warning: false
+
+cluster_revised_cols <- state_cols_all
+
+# Safeguard: every state in the object needs a colour
+stopifnot(all(levels(obj_revised$cluster_revised) %in% names(cluster_revised_cols)))
+```
+
+```{r}
+#| label: fig-umap-revised-labels
+#| message: false
+#| warning: false
+#| fig-cap: "UMAP of the revised CD4 T-cell object coloured by refined transcriptional state after removal of non-target populations."
+#| fig-width: 8.5
+#| fig-height: 6.2
+#| fig-dpi: 300
+
+state_order <- state_levels_all
+
+state_labels <- state_labels_all
+
+# Safeguard: every state in the object must be in the lists above
+stopifnot(all(as.character(unique(obj_revised$cluster_revised)) %in% state_order))
+
+umap_df <- as.data.frame(Embeddings(obj_revised, reduction = "umap")) |>
+  tibble::rownames_to_column("cell") |>
+  dplyr::left_join(
+    obj_revised@meta.data |>
+      tibble::rownames_to_column("cell") |>
+      dplyr::select(cell, cluster_revised),
+    by = "cell"
+  )
+
+colnames(umap_df)[2:3] <- c("UMAP_1", "UMAP_2")
+
+umap_df <- umap_df |>
+  dplyr::mutate(
+    cluster_revised = factor(as.character(cluster_revised), levels = state_order)
+  )
+
+# Label positions: median UMAP coordinates of each state
+label_df <- umap_df |>
+  dplyr::group_by(cluster_revised) |>
+  dplyr::summarise(
+    UMAP_1 = median(UMAP_1),
+    UMAP_2 = median(UMAP_2),
+    .groups = "drop"
+  ) |>
+  dplyr::mutate(label = state_labels[as.character(cluster_revised)])
+
+p_umap_revised <- ggplot2::ggplot(
+  umap_df,
+  ggplot2::aes(x = UMAP_1, y = UMAP_2, color = cluster_revised)
+) +
+  ggplot2::geom_point(size = 0.35, alpha = 0.8, stroke = 0) +
+  ggplot2::scale_color_manual(
+    values = cluster_revised_cols[state_order],
+    labels = state_labels[state_order],
+    breaks = state_order,
+    na.value = "grey85"
+  ) +
+  ggrepel::geom_text_repel(
+    data = label_df,
+    ggplot2::aes(x = UMAP_1, y = UMAP_2, label = label),
+    inherit.aes = FALSE,
+    color = "black",
+    segment.color = "black",
+    segment.size = 0.35,
+    box.padding = 0.6,
+    point.padding = 0.3,
+    min.segment.length = 0,
+    max.overlaps = Inf,
+    seed = 123,
+    size = 3.2
+  ) +
+  ggplot2::guides(
+    color = ggplot2::guide_legend(
+      override.aes = list(size = 3.2, alpha = 1)
+    )
+  ) +
+  ggplot2::coord_cartesian(clip = "off") +
+  ggplot2::labs(x = "UMAP 1", y = "UMAP 2", color = NULL) +
+  ggplot2::theme_classic(base_size = 10) +
+  ggplot2::theme(
+    panel.grid = ggplot2::element_blank(),
+    panel.border = ggplot2::element_blank(),
+    axis.line = ggplot2::element_line(color = "black", linewidth = 0.45),
+    axis.ticks = ggplot2::element_line(color = "black", linewidth = 0.35),
+    axis.title = ggplot2::element_text(size = 10, color = "black"),
+    axis.text = ggplot2::element_text(size = 8.5, color = "black"),
+    legend.position = "right",
+    legend.text = ggplot2::element_text(size = 8.5),
+    legend.key.height = grid::unit(0.38, "cm"),
+    legend.key.width = grid::unit(0.38, "cm"),
+    plot.margin = ggplot2::margin(5.5, 22, 5.5, 5.5)
+  )
+
+p_umap_revised
+
+ggplot2::ggsave(
+  filename = "figures/Figure1C_UMAP_refined_states.png",
+  plot = p_umap_revised,
+  width = 8.5,
+  height = 6.2,
+  units = "in",
+  dpi = 600,
+  bg = "white"
+)
+```
+
+```{r}
+#| label: fig-umap-split-treatment-balanced
+#| message: false
+#| warning: false
+#| fig-cap: "UMAP embeddings split by treatment condition using the same embedding coordinates. Conditions were downsampled to equal total cell numbers while preserving within-condition cluster proportions for visual comparability."
+#| fig-width: 11
+#| fig-height: 5.8
+#| fig-dpi: 300
+
+set.seed(123)
+
+state_order <- state_levels_all
+
+state_labels <- state_labels_all
+
+stopifnot(all(as.character(unique(obj_revised$cluster_revised)) %in% state_order))
+
+# -----------------------------
+# Extract UMAP coordinates
+# -----------------------------
+umap_df <- as.data.frame(
+  Embeddings(obj_revised, reduction = "umap")
+) |>
+  tibble::rownames_to_column("cell") |>
+  dplyr::left_join(
+    obj_revised@meta.data |>
+      tibble::rownames_to_column("cell") |>
+      dplyr::select(cell, cluster_revised, Condition),
+    by = "cell"
+  )
+
+colnames(umap_df)[2:3] <- c("UMAP_1", "UMAP_2")
+
+umap_df <- umap_df |>
+  dplyr::mutate(
+    Condition = dplyr::case_when(
+      Condition %in% c("Control") ~ "Control",
+      Condition %in% c("TNFR2a") ~ "TNFR2a",
+      TRUE ~ as.character(Condition)
+    ),
+    cluster_revised = factor(as.character(cluster_revised), levels = state_order),
+    Condition = factor(Condition, levels = c("Control", "TNFR2a"))
+  )
+
+# -----------------------------
+# Label positions (median of each state, full object)
+# -----------------------------
+label_df <- umap_df |>
+  dplyr::group_by(cluster_revised) |>
+  dplyr::summarise(
+    UMAP_1 = median(UMAP_1),
+    UMAP_2 = median(UMAP_2),
+    .groups = "drop"
+  ) |>
+  dplyr::mutate(label = state_labels[as.character(cluster_revised)])
+
+# -----------------------------
+# Equalize total cells while preserving within-condition proportions
+# -----------------------------
+condition_counts <- umap_df |>
+  dplyr::count(Condition, name = "condition_n")
+
+target_n <- min(condition_counts$condition_n)
+
+sampling_plan <- umap_df |>
+  dplyr::count(Condition, cluster_revised, name = "cluster_n") |>
+  dplyr::left_join(condition_counts, by = "Condition") |>
+  dplyr::group_by(Condition) |>
+  dplyr::mutate(
+    target_cluster_n = round(cluster_n / condition_n * target_n),
+    target_cluster_n = pmin(cluster_n, target_cluster_n)
+  ) |>
+  dplyr::ungroup() |>
+  dplyr::mutate(
+    target_cluster_n = dplyr::if_else(
+      cluster_n > 0 & target_cluster_n == 0,
+      1L,
+      as.integer(target_cluster_n)
+    )
+  )
+
+balanced_df <- umap_df |>
+  dplyr::filter(!is.na(Condition), !is.na(cluster_revised)) |>
+  dplyr::left_join(
+    sampling_plan |>
+      dplyr::select(Condition, cluster_revised, target_cluster_n),
+    by = c("Condition", "cluster_revised")
+  ) |>
+  dplyr::group_by(Condition, cluster_revised) |>
+  dplyr::group_modify(~ {
+    n_to_sample <- as.integer(unique(.x$target_cluster_n)[1])
+    dplyr::slice_sample(.x, n = n_to_sample, replace = FALSE)
+  }) |>
+  dplyr::ungroup() |>
+  dplyr::select(-target_cluster_n)
+
+balanced_df |>
+  dplyr::count(Condition)
+
+# Repeat labels in each facet panel
+label_facets <- tidyr::crossing(
+  label_df,
+  Condition = factor(c("Control", "TNFR2a"), levels = c("Control", "TNFR2a"))
+)
+
+# -----------------------------
+# Plot
+# -----------------------------
+p_umap <- ggplot2::ggplot(
+  balanced_df,
+  ggplot2::aes(x = UMAP_1, y = UMAP_2, color = cluster_revised)
+) +
+  ggplot2::geom_point(size = 0.30, alpha = 0.8, stroke = 0) +
+  ggplot2::facet_wrap(~Condition, nrow = 1) +
+  ggplot2::scale_color_manual(
+    values = cluster_revised_cols[state_order],
+    labels = state_labels[state_order],
+    breaks = state_order,
+    na.value = "grey85"
+  ) +
+  ggplot2::guides(
+    color = ggplot2::guide_legend(
+      override.aes = list(size = 3.8, alpha = 1),
+      keyheight = grid::unit(0.42, "cm"),
+      keywidth = grid::unit(0.42, "cm")
+    )
+  ) +
+  ggrepel::geom_text_repel(
+    data = label_facets,
+    ggplot2::aes(x = UMAP_1, y = UMAP_2, label = label),
+    inherit.aes = FALSE,
+    color = "black",
+    segment.color = "black",
+    segment.size = 0.35,
+    box.padding = 0.6,
+    point.padding = 0.3,
+    min.segment.length = 0,
+    max.overlaps = Inf,
+    seed = 123,
+    size = 3.0
+  ) +
+  ggplot2::coord_cartesian(clip = "off") +
+  ggplot2::labs(x = "UMAP 1", y = "UMAP 2", color = NULL) +
+  ggplot2::theme_classic(base_size = 10) +
+  ggplot2::theme(
+    panel.grid = ggplot2::element_blank(),
+    panel.border = ggplot2::element_blank(),
+    axis.line = ggplot2::element_line(color = "black", linewidth = 0.45),
+    axis.ticks = ggplot2::element_line(color = "black", linewidth = 0.35),
+    axis.title = ggplot2::element_text(size = 10, color = "black"),
+    axis.text = ggplot2::element_text(size = 8.5, color = "black"),
+    strip.background = ggplot2::element_blank(),
+    strip.text = ggplot2::element_text(size = 11, face = "bold", color = "black"),
+    legend.position = "right",
+    legend.text = ggplot2::element_text(size = 8.5, color = "black"),
+    legend.key = ggplot2::element_blank(),
+    legend.key.height = grid::unit(0.42, "cm"),
+    legend.key.width = grid::unit(0.42, "cm"),
+    legend.spacing.y = grid::unit(0.04, "cm"),
+    plot.margin = ggplot2::margin(5.5, 22, 5.5, 5.5)
+  )
+
+p_umap
+
+ggplot2::ggsave(
+  filename = "figures/Figure2A_UMAP_split_by_treatment_balanced.png",
+  plot = p_umap,
+  width = 11,
+  height = 5.8,
+  units = "in",
+  dpi = 600,
+  bg = "white"
+)
+```
+
+### Composition of revised states
+
+```{r}
+#| label: fig-revised-condition-composition-publication
+#| message: false
+#| warning: false
+#| fig-cap: "Relative composition of refined CD4 T-cell states across treatment conditions."
+#| fig-width: 3.4
+#| fig-height: 4.2
+#| fig-dpi: 300
+
+state_levels <- state_levels_all
+
+state_labels <- state_labels_all
+
+stopifnot(all(as.character(unique(obj_revised$cluster_revised)) %in% state_levels))
+
+plot_state_levels <- rev(state_levels)
+
+df_comp <- obj_revised@meta.data |>
+  dplyr::filter(
+    !is.na(Condition),
+    !is.na(cluster_revised)
+  ) |>
+  dplyr::mutate(
+    Condition = dplyr::case_when(
+      Condition %in% c("TNFR2a") ~ "TNFR2a",
+      Condition %in% c("Control") ~ "Control",
+      TRUE ~ as.character(Condition)
+    ),
+    Condition = factor(Condition, levels = c("Control", "TNFR2a")),
+    cluster_revised = factor(as.character(cluster_revised), levels = plot_state_levels)
+  ) |>
+  dplyr::count(Condition, cluster_revised, name = "n") |>
+  tidyr::complete(
+    Condition,
+    cluster_revised,
+    fill = list(n = 0)
+  ) |>
+  dplyr::group_by(Condition) |>
+  dplyr::mutate(prop = n / sum(n)) |>
+  dplyr::ungroup()
+
+p_comp <- ggplot2::ggplot(
+  df_comp,
+  ggplot2::aes(x = Condition, y = prop, fill = cluster_revised)
+) +
+  ggplot2::geom_col(
+    width = 0.48,
+    color = "white",
+    linewidth = 0.25
+  ) +
+  ggplot2::scale_fill_manual(
+    values = cluster_revised_cols[plot_state_levels],
+    breaks = plot_state_levels,
+    labels = state_labels[plot_state_levels],
+    name = NULL
+  ) +
+  ggplot2::scale_y_continuous(
+    labels = scales::percent_format(accuracy = 25),
+    limits = c(0, 1),
+    breaks = c(0, 0.25, 0.50, 0.75, 1),
+    expand = ggplot2::expansion(mult = c(0, 0.01))
+  ) +
+  ggplot2::labs(x = NULL, y = "Proportion of CD4 T cells") +
+  ggplot2::theme_classic(base_size = 8) +
+  ggplot2::theme(
+    axis.line = ggplot2::element_line(color = "black", linewidth = 0.35),
+    axis.ticks = ggplot2::element_line(color = "black", linewidth = 0.25),
+    axis.text.x = ggplot2::element_text(size = 8, color = "black"),
+    axis.text.y = ggplot2::element_text(size = 7.5, color = "black"),
+    axis.title.y = ggplot2::element_text(size = 8.5, color = "black"),
+    legend.position = "none",
+    plot.margin = ggplot2::margin(2, 2, 2, 2)
+  )
+
+p_comp
+
+ggplot2::ggsave(
+  filename = "figures/Figure2B_revised_state_composition_compact.png",
+  plot = p_comp,
+  width = 3.4,
+  height = 4.2,
+  units = "in",
+  dpi = 600,
+  bg = "white"
+)
+```
+
+Pooled proportions are shown for orientation only. Because cell numbers differ between mice, composition is tested formally below with per-mouse proportions and with neighbourhood-level differential abundance (Milo).
+
+### Diagnostic marker review of revised states
+
+```{r}
+#| label: define-diagnostic-markers-revised
+#| message: false
+#| warning: false
+
+marker_groups <- state_marker_groups
+
+marker_order <- unlist(marker_groups, use.names = FALSE)
+marker_order <- unique(marker_order)
+marker_order <- marker_order[marker_order %in% rownames(obj_revised[["SCT"]])]
+
+diagnostic_markers <- marker_order
+
+marker_group_df <- tibble::tibble(
+  gene = unlist(marker_groups, use.names = FALSE),
+  marker_group = rep(names(marker_groups), lengths(marker_groups))
+) |>
+  dplyr::filter(gene %in% diagnostic_markers) |>
+  dplyr::mutate(
+    gene = factor(gene, levels = marker_order),
+    marker_group = factor(marker_group, levels = names(marker_groups))
+  )
+```
+
+```{r}
+#| label: fig-diagnostic-marker-dotplot-revised
+#| message: false
+#| warning: false
+#| fig-cap: "Canonical marker expression across refined CD4 T-cell states (row-scaled average expression)."
+#| fig-width: 9.5
+#| fig-height: 8
+#| fig-dpi: 300
+
+library(grid)
+
+# Work on a copy so obj_revised keeps its factor labels
+obj_heatmap <- subset(obj_revised, subset = !is.na(cluster_revised))
+
+state_levels_pub <- state_levels_all
+
+state_labels_pub <- state_labels_all
+
+stopifnot(all(as.character(unique(obj_heatmap$cluster_revised)) %in% state_levels_pub))
+
+obj_heatmap$cluster_revised <- factor(
+  as.character(obj_heatmap$cluster_revised),
+  levels = state_levels_pub
+)
+Idents(obj_heatmap) <- "cluster_revised"
+
+marker_groups_pub <- state_marker_groups
+
+# Keep only genes present in the SCT assay
+genes_present <- rownames(obj_heatmap[["SCT"]])
+missing_genes <- setdiff(unlist(marker_groups_pub), genes_present)
+if (length(missing_genes) > 0) {
+  message("Markers not found in SCT and skipped: ", paste(missing_genes, collapse = ", "))
+}
+marker_groups_pub <- lapply(marker_groups_pub, function(g) g[g %in% genes_present])
+marker_groups_pub <- marker_groups_pub[lengths(marker_groups_pub) > 0]
+
+diagnostic_markers_pub <- unlist(marker_groups_pub, use.names = FALSE)
+
+marker_group_df <- purrr::imap_dfr(
+  marker_groups_pub,
+  ~ tibble::tibble(gene = .x, marker_group = .y)
+)
+
+marker_order <- rev(diagnostic_markers_pub)
+
+avg_diag_revised <- AverageExpression(
+  obj_heatmap,
+  assays = "SCT",
+  features = diagnostic_markers_pub,
+  group.by = "cluster_revised",
+  return.seurat = FALSE
+)$SCT
+
+avg_diag_df <- as.data.frame(avg_diag_revised) |>
+  tibble::rownames_to_column("gene")
+
+# AverageExpression turns "_" into "-" in group names; convert back
+colnames(avg_diag_df) <- gsub("-", "_", colnames(avg_diag_df))
+
+present_states <- intersect(state_levels_pub, colnames(avg_diag_df))
+
+avg_diag_long <- avg_diag_df |>
+  dplyr::select(gene, dplyr::all_of(present_states)) |>
+  tidyr::pivot_longer(
+    cols = -gene,
+    names_to = "cluster_revised",
+    values_to = "avg_expr"
+  ) |>
+  dplyr::group_by(gene) |>
+  dplyr::mutate(avg_expr = as.numeric(scale(avg_expr))) |>
+  dplyr::ungroup() |>
+  dplyr::left_join(marker_group_df, by = "gene") |>
+  dplyr::mutate(
+    cluster_revised = factor(cluster_revised, levels = present_states),
+    gene = factor(gene, levels = marker_order),
+    marker_group = factor(marker_group, levels = rev(names(marker_groups_pub)))
+  )
+
+p_heatmap <- ggplot2::ggplot(
+  avg_diag_long,
+  ggplot2::aes(x = cluster_revised, y = gene, fill = avg_expr)
+) +
+  ggplot2::geom_tile(color = "white", linewidth = 0.3) +
+  ggplot2::facet_grid(
+    marker_group ~ .,
+    scales = "free_y",
+    space = "free_y",
+    switch = "y"
+  ) +
+  ggplot2::scale_fill_gradient2(
+    low = "#3B4CC0",
+    mid = "#F7F7F7",
+    high = "#E66100",
+    midpoint = 0,
+    limits = c(-2.5, 2.5),
+    oob = scales::squish
+  ) +
+  ggplot2::scale_x_discrete(labels = state_labels_pub[present_states]) +
+  ggplot2::labs(x = NULL, y = NULL, fill = "Scaled\nexpression") +
+  ggplot2::coord_cartesian(clip = "off") +
+  ggplot2::theme_classic(base_size = 10) +
+  ggplot2::theme(
+    panel.grid = ggplot2::element_blank(),
+    panel.spacing.y = grid::unit(0.16, "lines"),
+    panel.border = ggplot2::element_rect(color = "grey75", fill = NA, linewidth = 0.45),
+    strip.placement = "outside",
+    strip.background.y.left = ggplot2::element_rect(
+      fill = "grey96", color = "grey80", linewidth = 0.45
+    ),
+    strip.text.y.left = ggplot2::element_text(
+      angle = 0, face = "bold", size = 8.5,
+      margin = ggplot2::margin(0, 3, 0, 3)
+    ),
+    axis.text.x = ggplot2::element_text(
+      angle = 45, hjust = 1, vjust = 1, size = 8.5, color = "black"
+    ),
+    axis.text.y = ggplot2::element_text(size = 7.5, color = "black"),
+    axis.title = ggplot2::element_text(size = 10),
+    legend.title = ggplot2::element_text(size = 8.5),
+    legend.text = ggplot2::element_text(size = 8),
+    legend.key.height = grid::unit(0.45, "cm"),
+    legend.key.width = grid::unit(0.35, "cm"),
+    plot.margin = ggplot2::margin(5.5, 12, 5.5, 5.5)
+  )
+
+p_heatmap
+
+ggplot2::ggsave(
+  filename = "figures/Figure1D_marker_heatmap.png",
+  plot = p_heatmap,
+  width = 9.5,
+  height = 8,
+  units = "in",
+  dpi = 600,
+  bg = "white"
+)
+
+ggplot2::ggsave(
+  filename = "figures/Figure1D_marker_heatmap.pdf",
+  plot = p_heatmap,
+  width = 9.5,
+  height = 8,
+  units = "in",
+  device = cairo_pdf,
+  bg = "white"
+)
+```
+
+```{r}
+#| label: tbl-bcell-residual-check
+#| tbl-cap: "Residual B-cell signal per provisional cluster (percentage of cells with detected counts)."
+
+tmp <- obj_revised
+DefaultAssay(tmp) <- "RNA"
+tmp <- JoinLayers(tmp, assay = "RNA")
+m <- GetAssayData(tmp, assay = "RNA", layer = "counts")
+rm(tmp); gc()
+
+bgenes <- intersect(c("Cd19", "Ms4a1", "Cd79a", "Cd79b"), rownames(m))
+stopifnot(all(c("Cd19", "Ms4a1", "Cd3e") %in% rownames(m)))
+
+b_any <- Matrix::colSums(m[bgenes, , drop = FALSE] > 0) >= 2  # 2+ B-cell genes detected
+
+bcell_chk <- data.frame(
+  cluster_primary = obj_revised$cluster_primary,
+  state           = obj_revised$cluster_revised,
+  b_any           = b_any,
+  Cd19            = m["Cd19", ] > 0,
+  Ms4a1           = m["Ms4a1", ] > 0,
+  Cd3e            = m["Cd3e", ] > 0
+)
+
+bcell_tbl <- bcell_chk %>%
+  group_by(cluster_primary, state) %>%
+  summarise(
+    n           = n(),
+    pct_Cd19    = round(100 * mean(Cd19), 1),
+    pct_Ms4a1   = round(100 * mean(Ms4a1), 1),
+    pct_2plus_B = round(100 * mean(b_any), 1),
+    pct_Cd3e    = round(100 * mean(Cd3e), 1),
+    .groups = "drop"
+  ) %>%
+  arrange(desc(pct_2plus_B))
+
+write.csv(bcell_tbl, "data/revised_bcell_residual_check.csv", row.names = FALSE)
+knitr::kable(bcell_tbl)
+```
+```
+
+```{r}
+#| label: save-revised-objects
+#| message: false
+#| warning: false
+#| eval: true
+
+saveRDS(obj_revised, file = "data/TCRseq_revised_clustering.rds")
+readr::write_csv(decision_table, "data/revised_clustering_decisions.csv")
+```
+
+Diagnostic marker review supports the main refined states. Row scaling in the heatmap exaggerates genes with very low absolute expression, so residual B-cell signal was checked directly on raw counts: the highest fraction of cells with two or more B-cell genes detected (*Cd19*, *Ms4a1*, *Cd79a*, *Cd79b*) in any provisional cluster was `r max(bcell_tbl$pct_2plus_B)`% (@tbl-bcell-residual-check), so B-cell contamination is negligible.
+
+### Mouse-level composition and differential abundance
+
+Each mouse is treated as a biological replicate. The first figure shows per-mouse state proportions. The second uses Milo [@dann2022milo], which tests differential abundance on overlapping k-nearest-neighbour neighbourhoods instead of predefined clusters, so shifts that cut across cluster boundaries can still be detected.
+
+```{r}
+#| label: fig-state-proportion-boxplots-mouse-level
+#| message: false
+#| warning: false
+#| fig-cap: "Mouse-level proportions of refined CD4 T-cell states across treatment conditions. Each point represents one biological replicate."
+#| fig-width: 10.5
+#| fig-height: 8.5
+#| fig-dpi: 300
+
+set.seed(123)
+
+state_levels <- state_levels_all
+
+state_labels <- state_labels_all
+
+stopifnot(all(as.character(unique(obj_revised$cluster_revised)) %in% state_levels))
+
+meta_prop <- obj_revised@meta.data |>
+  tibble::rownames_to_column("cell") |>
+  dplyr::filter(
+    !is.na(Condition),
+    !is.na(cluster_revised)
+  ) |>
+  dplyr::mutate(
+    Condition = dplyr::case_when(
+      Condition %in% c("Control") ~ "Control",
+      Condition %in% c("TNFR2a") ~ "TNFR2a",
+      TRUE ~ as.character(Condition)
+    ),
+    Condition = factor(Condition, levels = c("Control", "TNFR2a")),
+    cluster_revised = factor(as.character(cluster_revised), levels = state_levels)
+  )
+
+# Biological replicate / mouse column
+replicate_col <- "orig.ident"
+
+df_mouse_prop <- meta_prop |>
+  dplyr::rename(mouse_id = dplyr::all_of(replicate_col)) |>
+  dplyr::count(mouse_id, Condition, cluster_revised, name = "n_state") |>
+  tidyr::complete(
+    tidyr::nesting(mouse_id, Condition),
+    cluster_revised,
+    fill = list(n_state = 0)
+  ) |>
+  dplyr::group_by(mouse_id, Condition) |>
+  dplyr::mutate(
+    total_cells = sum(n_state),
+    prop = n_state / total_cells
+  ) |>
+  dplyr::ungroup() |>
+  dplyr::filter(total_cells > 0) |>
+  dplyr::mutate(
+    state_label = factor(
+      state_labels[as.character(cluster_revised)],
+      levels = state_labels[state_levels]
+    )
+  )
+
+p_state_box <- ggplot2::ggplot(
+  df_mouse_prop,
+  ggplot2::aes(x = Condition, y = prop, fill = Condition)
+) +
+  ggplot2::geom_boxplot(
+    width = 0.55,
+    outlier.shape = NA,
+    linewidth = 0.45,
+    alpha = 0.85
+  ) +
+  ggplot2::geom_point(
+    ggplot2::aes(group = mouse_id),
+    position = ggplot2::position_jitter(width = 0.08, height = 0),
+    size = 1.8,
+    alpha = 0.9,
+    stroke = 0
+  ) +
+  ggplot2::facet_wrap(~state_label, scales = "free_y", ncol = 3) +
+  ggplot2::scale_y_continuous(
+    labels = scales::label_percent(accuracy = 0.1, drop0trailing = TRUE),
+    expand = ggplot2::expansion(mult = c(0.05, 0.12))
+  ) +
+  ggplot2::scale_fill_manual(
+    values = c("Control" = "grey70", "TNFR2a" = "grey25")
+  ) +
+  ggplot2::labs(x = NULL, y = "Proportion of CD4 T cells") +
+  ggplot2::theme_classic(base_size = 10) +
+  ggplot2::theme(
+    legend.position = "none",
+    strip.background = ggplot2::element_blank(),
+    strip.text = ggplot2::element_text(size = 10, face = "bold", color = "black"),
+    axis.line = ggplot2::element_line(color = "black", linewidth = 0.4),
+    axis.ticks = ggplot2::element_line(color = "black", linewidth = 0.3),
+    axis.text.x = ggplot2::element_text(size = 8.5, color = "black"),
+    axis.text.y = ggplot2::element_text(size = 8, color = "black"),
+    axis.title.y = ggplot2::element_text(size = 10, color = "black"),
+    plot.margin = ggplot2::margin(6, 8, 6, 6)
+  )
+
+p_state_box
+
+ggplot2::ggsave(
+  filename = "figures/Figure2C_mouse_level_state_proportion_boxplots.png",
+  plot = p_state_box,
+  width = 10.5,
+  height = 8.5,
+  units = "in",
+  dpi = 600,
+  bg = "white"
+)
+```
+
+```{r}
+#| label: fig-milo-da-umap
+#| message: false
+#| warning: false
+#| fig-cap: "Milo neighbourhood differential abundance analysis projected onto the shared UMAP embedding. Significant neighbourhoods are coloured by treatment enrichment direction."
+#| fig-width: 8.5
+#| fig-height: 6.5
+#| fig-dpi: 300
+
+set.seed(123)
+
+sample_col <- "orig.ident"   # biological replicate / mouse column
+
+meta_milo <- obj_revised@meta.data |>
+  tibble::rownames_to_column("cell") |>
+  dplyr::filter(
+    !is.na(Condition),
+    !is.na(cluster_revised),
+    !is.na(.data[[sample_col]])
+  ) |>
+  dplyr::mutate(
+    Condition = dplyr::case_when(
+      Condition %in% c("Control") ~ "Control",
+      Condition %in% c("TNFR2a") ~ "TNFR2a",
+      TRUE ~ as.character(Condition)
+    ),
+    Condition = factor(Condition, levels = c("Control", "TNFR2a")),
+    mouse_id = as.character(.data[[sample_col]])
+  )
+
+cells_use <- meta_milo$cell
+
+obj_milo_input <- subset(obj_revised, cells = cells_use)
+
+# -----------------------------
+# Seurat v5-compatible conversion
+# -----------------------------
+DefaultAssay(obj_milo_input) <- "RNA"
+
+obj_milo_input[["RNA"]] <- SeuratObject::JoinLayers(
+  obj_milo_input[["RNA"]]
+)
+
+counts_mat <- SeuratObject::GetAssayData(
+  obj_milo_input,
+  assay = "RNA",
+  layer = "counts"
+)
+
+sce <- SingleCellExperiment::SingleCellExperiment(
+  assays = list(counts = counts_mat),
+  colData = obj_milo_input@meta.data
+)
+
+SingleCellExperiment::reducedDim(sce, "PCA") <- Seurat::Embeddings(
+  obj_milo_input,
+  reduction = "pca"
+)
+
+SingleCellExperiment::reducedDim(sce, "UMAP") <- Seurat::Embeddings(
+  obj_milo_input,
+  reduction = "umap"
+)
+
+SummarizedExperiment::colData(sce)$Condition <- meta_milo$Condition[
+  match(colnames(sce), meta_milo$cell)
+]
+
+SummarizedExperiment::colData(sce)$mouse_id <- meta_milo$mouse_id[
+  match(colnames(sce), meta_milo$cell)
+]
+
+milo_obj <- Milo(sce)
+
+milo_obj <- buildGraph(
+  milo_obj,
+  k = 30,
+  d = 30,
+  reduced.dim = "PCA"
+)
+
+milo_obj <- makeNhoods(
+  milo_obj,
+  prop = 0.10,
+  k = 30,
+  d = 30,
+  refined = TRUE,
+  reduced_dims = "PCA"
+)
+
+milo_obj <- countCells(
+  milo_obj,
+  meta.data = as.data.frame(SummarizedExperiment::colData(milo_obj)),
+  samples = "mouse_id"
+)
+
+milo_obj <- calcNhoodDistance(
+  milo_obj,
+  d = 30,
+  reduced.dim = "PCA"
+)
+
+design_df <- as.data.frame(SummarizedExperiment::colData(milo_obj)) |>
+  dplyr::select(mouse_id, Condition) |>
+  dplyr::distinct() |>
+  dplyr::mutate(
+    Condition = factor(Condition, levels = c("Control", "TNFR2a"))
+  )
+
+rownames(design_df) <- design_df$mouse_id
+
+da_res <- testNhoods(
+  milo_obj,
+  design = ~ Condition,
+  design.df = design_df
+)
+
+da_res <- da_res |>
+  dplyr::mutate(
+    enrichment = dplyr::case_when(
+      SpatialFDR < 0.10 & logFC > 0 ~ "TNFR2a enriched",
+      SpatialFDR < 0.10 & logFC < 0 ~ "Control enriched",
+      TRUE ~ "Not significant"
+    )
+  )
+
+umap_bg <- as.data.frame(SingleCellExperiment::reducedDim(milo_obj, "UMAP")) |>
+  tibble::rownames_to_column("cell")
+
+colnames(umap_bg)[2:3] <- c("UMAP_1", "UMAP_2")
+
+nhood_list <- nhoodIndex(milo_obj)
+
+nhood_centres <- purrr::map_dfr(
+  seq_along(nhood_list),
+  function(i) {
+    cells_i <- colnames(milo_obj)[nhood_list[[i]]]
+
+    umap_i <- umap_bg |>
+      dplyr::filter(cell %in% cells_i)
+
+    tibble::tibble(
+      Nhood = i,
+      UMAP_1 = mean(umap_i$UMAP_1),
+      UMAP_2 = mean(umap_i$UMAP_2),
+      n_cells = length(cells_i)
+    )
+  }
+)
+
+plot_da <- nhood_centres |>
+  dplyr::left_join(da_res, by = "Nhood") |>
+  dplyr::mutate(
+    enrichment = factor(
+      enrichment,
+      levels = c("Control enriched", "TNFR2a enriched", "Not significant")
+    )
+  )
+
+p_milo <- ggplot2::ggplot() +
+  ggplot2::geom_point(
+    data = umap_bg,
+    ggplot2::aes(x = UMAP_1, y = UMAP_2),
+    color = "grey88",
+    size = 0.25,
+    alpha = 0.45,
+    stroke = 0
+  ) +
+  ggplot2::geom_point(
+    data = plot_da,
+    ggplot2::aes(
+      x = UMAP_1,
+      y = UMAP_2,
+      color = enrichment,
+      size = -log10(SpatialFDR)
+    ),
+    alpha = 0.9
+  ) +
+  ggplot2::scale_color_manual(
+    values = c(
+      "Control enriched" = "#B2182B",
+      "TNFR2a enriched" = "#2166AC",
+      "Not significant" = "grey70"
+    ),
+    name = NULL
+  ) +
+  ggplot2::scale_size_continuous(
+    range = c(0.6, 3.2),
+    name = expression(-log[10]("Spatial FDR"))
+  ) +
+  ggplot2::labs(
+    x = "UMAP 1",
+    y = "UMAP 2"
+  ) +
+  ggplot2::theme_classic(base_size = 10) +
+  ggplot2::theme(
+    axis.line = ggplot2::element_line(color = "black", linewidth = 0.45),
+    axis.ticks = ggplot2::element_line(color = "black", linewidth = 0.35),
+    axis.text = ggplot2::element_text(size = 8.5, color = "black"),
+    axis.title = ggplot2::element_text(size = 10, color = "black"),
+    legend.position = "right",
+    legend.text = ggplot2::element_text(size = 8.5),
+    legend.title = ggplot2::element_text(size = 9),
+    plot.margin = ggplot2::margin(6, 10, 6, 6)
+  )
+
+p_milo
+
+ggplot2::ggsave(
+  filename = "figures/Figure2E_Milo_neighbourhood_DA_UMAP.png",
+  plot = p_milo,
+  width = 8.5,
+  height = 6.5,
+  units = "in",
+  dpi = 600,
+  bg = "white"
+)
+```
+
+## Interpretation
+
+Refinement produced a lung CD4⁺ T-cell object with ten states. Two non-target populations (CD8⁺ T cells and iNKT-like cells) were removed, and two technical clusters were kept but flagged. The states are supported by canonical markers and broadly agree with the depositors' independent annotation.
+
+The clearest result is a shift in composition under TNFR2 agonism, seen consistently in every mouse:
+
+- **Treg tissue-like** cells rise from about 3% of CD4⁺ T cells in control mice to about 16% in TNFR2a-treated mice. This state expresses the highest levels of *Tnfrsf1b* (TNFR2) together with an effector/tissue-repair program (*Klrg1*, *Il1rl1*, *Areg*, *Tnfrsf9*).
+- **Cycling** cells rise from about 1.5% to about 9%, consistent with TNFR2-driven proliferation.
+- **Treg resting-like** cells increase more modestly.
+- **Naive-like** cells fall in proportion, from about 65% to about 44%. This is expected when other compartments expand, so it does not by itself show that naive cells were lost.
+
+Milo neighbourhood testing agrees: TNFR2a-enriched neighbourhoods concentrate in the Treg and cycling regions, and control-enriched neighbourhoods in the naive region.
+
+Th1/cytotoxic-like, activated/memory-like, Th2/tissue-like and IL-17-like states show no consistent change. The two `Unresolved_state` clusters are retained with a `low_quality_flag`, so that downstream results can be checked for sensitivity to them.
+
+## Summary
+
+TNFR2 agonism reshapes the lung CD4⁺ T-cell compartment mainly by expanding *Tnfrsf1b*-high tissue/effector Tregs and proliferating cells, in line with the original study's conclusion that TNFR2 agonism increases tissue and effector Tregs. The refined object (`cluster_revised`) is the input for the repertoire, differential expression, pathway and trajectory chapters.

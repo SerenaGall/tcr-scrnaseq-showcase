@@ -1,0 +1,635 @@
+---
+title: "QC and Integration"
+execute: 
+  echo: true
+  message: false
+  warning: false
+
+---
+
+```{r}
+#| label: setup
+#| message: false
+#| warning: false
+
+source("R/setup.R")
+source("R/helpers.R")
+```
+
+## Overview
+
+This chapter performs the main technical quality-control and integration steps required to convert the preprocessed multi-modal single-cell dataset into an analysis-ready object for downstream clustering and biological interpretation. Building on the preprocessing stage, the workflow here applies a second layer of technical filtering by removing transcriptome-based doublets, enforcing per-cell RNA quality thresholds, and then integrating the retained cells across samples using SCTransform and Harmony.
+
+The overall purpose of this chapter is twofold. First, it defines the set of cells considered suitable for downstream analysis after excluding likely technical artefacts such as same-sample doublets and low-quality transcriptomes. Second, it generates a shared low-dimensional representation in which cells from different samples can be compared in a common space while preserving the possibility of later checking whether integration may have obscured sample-specific structure.
+
+This chapter should therefore be interpreted as a technical transition between preprocessing and biological analysis. The outputs here are not final cell identities or treatment effects. Rather, they define the cleaned and integrated dataset that will be used for subsequent clustering, annotation, differential expression, pathway analysis, trajectory inference, and clonotype analysis.
+
+## Doublet detection
+
+Hashtag-based demultiplexing was first used to remove cross-sample multiplets. Transcriptome-based doublet detection was then performed independently within each sample using DoubletFinder to identify putative same-sample doublets. These assignments were used as a conservative QC step for downstream analysis and were interpreted as technical classifications rather than biological states.
+
+DoubletFinder was applied using a fixed parameterization across samples for consistency; these calls were used as pragmatic QC filters and should not be interpreted as precise estimates of true doublet frequency.
+
+```{r}
+#| label: load-preprocessed-and-split
+#| message: false
+#| warning: false
+
+# HTO-demultiplexed merged object from Preprocessing
+TCRseq_merged <- readRDS("data/TCRseq_merged_preprocessed.rds")
+
+# Keep HTO singlets only
+TCRseq_singlet <- subset(
+  TCRseq_merged,
+  subset = HTO_classification.global == "Singlet"
+)
+
+# Split by sample
+TCRseq_by_sample <- SplitObject(TCRseq_singlet, split.by = "orig.ident")
+
+```
+
+```{r}
+#| label: run-doubletfinder
+#| message: false
+#| warning: false
+
+TCRseq_by_sample_DF <- lapply(TCRseq_by_sample, function(x) {
+
+  DefaultAssay(x) <- "RNA"
+
+  # QC columns used for regression / reporting
+  # percent.mt carried over from the deposited metadata (mt genes not in the matrix)
+  # percent.rb carried over from the deposited metadata
+  x <- PercentageFeatureSet(x, pattern = "^Tra|^Trb|^Trd|^Trg", col.name = "TCRgene")
+
+  # Minimal pre-processing required for DoubletFinder
+  x <- NormalizeData(x, verbose = FALSE)
+  x <- FindVariableFeatures(x, verbose = FALSE)
+  x <- ScaleData(x, vars.to.regress = c("nFeature_RNA", "percent.mt"), verbose = FALSE)
+  x <- RunPCA(x, npcs = 20, verbose = FALSE)
+
+  # Approximate expected doublets based on recovered cell number; used as a QC heuristic
+  nExp <- round(ncol(x) * ((0.0008 * ncol(x) + 0.0527) / 100))
+  x$nExp_DF <- nExp
+
+  x <- doubletFinder(
+    x,
+    pN = 0.25,
+    pK = 0.09,
+    nExp = nExp,
+    PCs = 1:10
+  )
+
+  df_col <- grep("^DF\\.classifications", colnames(x@meta.data), value = TRUE)
+  df_col <- df_col[length(df_col)]
+
+  x$DF_status <- ifelse(
+    grepl("Doublet", x@meta.data[[df_col]], ignore.case = TRUE),
+    "Doublet", "Singlet"
+  )
+
+  x
+})
+
+TCRseq_merged_DF <- merge(x = TCRseq_by_sample_DF[[1]], y = TCRseq_by_sample_DF[-1])
+
+```
+
+```{r}
+#| label: doubletfinder-summary
+#| message: false
+#| warning: false
+#| tbl-cap: "Summary of transcriptome-based doublet detection (DoubletFinder) across samples after HTO singlet selection."
+
+TCRseq_merged_DF_list <- SplitObject(TCRseq_merged_DF, split.by = "orig.ident")
+
+summary_results <- quick_doublet_summary_auto(
+  TCRseq_merged_DF_list,
+  class_col = "DF_status",
+  sample_col = "orig.ident"
+)
+
+plot_data <- summary_results$summary_table
+knitr::kable(plot_data, digits = 3)
+
+```
+
+```{r}
+#| label: fig-doublet-counts
+#| message: false
+#| warning: false
+#| fig-cap: "Counts of cells classified as singlets or doublets by DoubletFinder for each sample."
+#| fig-width: 8
+#| fig-height: 5
+#| fig-dpi: 300
+
+plot_data_long <- data.frame(
+  Sample = rep(plot_data$Sample, 2),
+  Classification = rep(c("Singlet","Doublet"), each = nrow(plot_data)),
+  Count = c(plot_data$Singlet, plot_data$Doublet)
+)
+
+ggplot(plot_data_long, aes(x = Sample, y = Count, fill = Classification)) +
+  geom_col(position = position_dodge(width = 0.7), width = 0.7) +
+  geom_text(
+    aes(label = Count),
+    position = position_dodge(width = 0.7),
+    vjust = -0.25, size = 3
+  ) +
+  labs(x = "Sample", y = "Number of cells", fill = NULL) +
+  theme_minimal(base_size = 12) +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1),
+        legend.position = "top") +
+  scale_y_continuous(expand = expansion(mult = c(0, 0.08)))
+
+```
+
+```{r}
+#| label: fig-doublet-rate
+#| message: false
+#| warning: false
+#| fig-cap: "Doublet rate (%) per sample estimated by DoubletFinder after HTO singlet selection."
+#| fig-width: 8
+#| fig-height: 5
+#| fig-dpi: 300
+
+ggplot(plot_data, aes(x = Sample, y = Doublet_Rate)) +
+  geom_col(width = 0.7) +
+  geom_text(aes(label = paste0(Doublet_Rate, "%")), vjust = -0.25, size = 3) +
+  labs(x = "Sample", y = "Doublet rate (%)") +
+  theme_minimal(base_size = 12) +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1)) +
+  scale_y_continuous(expand = expansion(mult = c(0, 0.12)))
+
+```
+
+Expected doublet numbers scale with the number of cells per sample, so the rates are reported per mouse as QC outputs rather than as comparable biological quantities.
+
+```{r}
+#| label: subset-df-singlets
+#| message: false
+#| warning: false
+
+TCRseq_merged_singlet <- subset(TCRseq_merged_DF, subset = DF_status == "Singlet")
+```
+
+```{r}
+#| label: save-doubletfinder-outputs
+#| message: false
+#| warning: false
+
+saveRDS(TCRseq_merged_DF,      file = "data/TCRseq_merged_with_doublets.rds")
+saveRDS(TCRseq_merged_singlet, file = "data/TCRseq_merged_singlets.rds")
+```
+
+## Quality Control
+
+This section summarises the quality control procedures applied after HTO-based singlet selection and transcriptome-based doublet removal. Key per-cell QC metrics, including library size (`nCount_RNA`), number of detected genes (`nFeature_RNA`), mitochondrial transcript proportion, ribosomal transcript proportion, and transcriptome complexity (`log10GenesPerUMI`), were computed on a per-sample basis.
+
+### Quality control metrics
+
+This section summarises key QC metrics among cells retained after HTO singlet selection, transcriptome-based doublet filtering, and threshold-based QC. These plots are presented as a descriptive overview of the retained dataset rather than as threshold-selection diagnostics.
+
+```{r}
+#| label: qc-split-singlets
+#| message: false
+#| warning: false
+
+TCRseq_list <- SplitObject(TCRseq_merged_singlet, split.by = "orig.ident")
+names(TCRseq_list)
+
+```
+
+```{r}
+#| label: qc-add-metrics-and-filter
+#| message: false
+#| warning: false
+
+# Compute QC metrics
+TCRseq_list <- lapply(TCRseq_list, function(x) {
+  DefaultAssay(x) <- "RNA"
+  # percent.mt carried over from the deposited metadata (mt genes not in the matrix)
+  # percent.rb carried over from the deposited metadata
+  x$log10GenesPerUMI <- log10(x$nFeature_RNA) / log10(pmax(x$nCount_RNA, 1))
+  x
+})
+
+# Olivier-style threshold filtering
+TCRseq_list <- lapply(TCRseq_list, function(x) {
+  keep <- x$nFeature_RNA > 300 &
+    x$percent.mt <= 20 &
+    x$log10GenesPerUMI >= 0.8
+
+  subset(x, cells = colnames(x)[which(keep)])
+})
+```
+
+```{r}
+#| label: table-cell-recovery-by-step
+#| message: false
+#| warning: false
+#| tbl-cap: "Cell recovery by sample across major preprocessing and QC steps."
+
+cells_hto_singlet <- TCRseq_singlet@meta.data |>
+  dplyr::count(orig.ident, name = "n_after_HTO_singlet")
+
+cells_after_df <- TCRseq_merged_singlet@meta.data |>
+  dplyr::count(orig.ident, name = "n_after_DoubletFinder")
+
+cells_after_qc <- lapply(TCRseq_list, function(x) {
+  data.frame(orig.ident = unique(x$orig.ident), n_after_QC = ncol(x))
+}) |>
+  dplyr::bind_rows()
+
+cell_recovery_summary <- cells_hto_singlet |>
+  dplyr::left_join(cells_after_df, by = "orig.ident") |>
+  dplyr::left_join(cells_after_qc, by = "orig.ident") |>
+  dplyr::mutate(
+    prop_keep_after_DF = n_after_DoubletFinder / n_after_HTO_singlet,
+    prop_keep_after_QC = n_after_QC / n_after_DoubletFinder
+  )
+
+knitr::kable(cell_recovery_summary, digits = 3)
+```
+
+```{r}
+#| label: fig-qc-violins-postfilter-grid
+#| message: false
+#| warning: false
+#| fig-cap: "QC metric distributions per sample after HTO singlet selection, DoubletFinder filtering, and Olivier-style QC filtering."
+#| fig-width: 12
+#| fig-height: 10
+#| fig-dpi: 300
+
+# merge for plotting
+TCRseq_qc_merged <- merge(x = TCRseq_list[[1]], y = TCRseq_list[-1])
+
+# pull QC metrics + sample labels
+qc_feats <- c(
+  "nCount_RNA",
+  "nFeature_RNA",
+  "percent.mt",
+  "log10GenesPerUMI",
+  "percent.rb"
+)
+
+qc_df <- FetchData(TCRseq_qc_merged, vars = c("orig.ident", qc_feats))
+
+qc_long <- qc_df |>
+  pivot_longer(cols = all_of(qc_feats), names_to = "metric", values_to = "value") |>
+  mutate(
+    metric = factor(metric, levels = qc_feats),
+    orig.ident = factor(orig.ident)
+  )
+
+ggplot(qc_long, aes(x = orig.ident, y = value)) +
+  geom_violin(scale = "width", trim = TRUE) +
+  theme_bw() +
+  theme(
+    axis.text.x = element_blank(),
+    axis.ticks.x = element_blank(),
+    strip.text = element_text(size = 10)
+  ) +
+  facet_grid(rows = vars(orig.ident), cols = vars(metric), scales = "free_y") +
+  labs(x = NULL, y = NULL)
+```
+
+## SCTransform and Harmony integration
+
+After QC filtering, the merged dataset was normalized with SCTransform and integrated using Harmony on the PCA space with orig.ident as the grouping variable. The Harmony embedding was used as a working representation for downstream clustering and visualization, while sample mixing was inspected descriptively rather than assumed.
+
+```{r}
+#| label: sct-harmony-setup
+#| message: false
+#| warning: false
+
+sex_genes <- c("Xist","Tsix","Ddx3y","Uty","Eif2s3y","Kdm5d","Jarid1d")
+tcr_regex <- "^(Tr[abdg])"
+
+cc <- mouse_cc_genes()
+
+cc_clean <- dplyr::filter(cc, !mgi_symbol %in% sex_genes)
+
+s.genes <- cc_clean |>
+  dplyr::filter(phase == "S") |>
+  dplyr::pull(mgi_symbol) |>
+  unique() |>
+  stats::na.omit() |>
+  as.character()
+
+g2m.genes <- cc_clean |>
+  dplyr::filter(phase == "G2M") |>
+  dplyr::pull(mgi_symbol) |>
+  unique() |>
+  stats::na.omit() |>
+  as.character()
+```
+
+```{r}
+#| label: merge-qc-filtered
+#| message: false
+#| warning: false
+
+# Merge filtered objects before SCT
+
+TCRseq_qc <- merge(x = TCRseq_list[[1]], y = TCRseq_list[-1])
+Idents(TCRseq_qc) <- "orig.ident"
+DefaultAssay(TCRseq_qc) <- "RNA"
+```
+
+```{r}
+#| label: fig-cells-per-sample-postqc
+#| message: false
+#| warning: false
+#| fig-cap: "Number of QC-filtered cells retained per sample prior to integration."
+#| fig-width: 8
+#| fig-height: 4
+#| fig-dpi: 300
+
+cell_counts_post_qc <- TCRseq_qc@meta.data |>
+  dplyr::count(orig.ident, name = "n_cells")
+
+ggplot(cell_counts_post_qc, aes(x = orig.ident, y = n_cells)) +
+  geom_col(width = 0.7) +
+  geom_text(aes(label = n_cells), vjust = -0.25, size = 3) +
+  labs(x = "Sample", y = "QC-filtered cells") +
+  theme_minimal(base_size = 12) +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1)) +
+  scale_y_continuous(expand = expansion(mult = c(0, 0.1)))
+```
+
+```{r}
+#| label: table-cells-by-condition-preintegration
+#| message: false
+#| warning: false
+#| tbl-cap: "Number of QC-filtered cells retained per sample and condition before integration."
+
+TCRseq_qc$Condition <- dplyr::case_when(
+  grepl("^TNFR2a_", TCRseq_qc$orig.ident) ~ "TNFR2a",
+  grepl("^Ctrl_", TCRseq_qc$orig.ident) ~ "Control",
+  TRUE ~ NA_character_
+)
+
+sample_condition_counts <- TCRseq_qc@meta.data |>
+  dplyr::count(orig.ident, Condition, name = "n_cells")
+
+knitr::kable(sample_condition_counts)
+```
+
+Control mice contributed somewhat more cells than TNFR2a mice, and cell numbers also varied between mice within each arm. Condition-level comparisons in later chapters are therefore made at the level of the mouse (proportions per mouse, pseudobulk models) instead of by pooling cells.
+
+```{r}
+#| label: make-rna2-assay
+#| message: false
+#| warning: false
+
+# Optional RNA2 assay excluding TCR and sex genes
+
+genes <- rownames(TCRseq_qc[["RNA"]])
+tcr_genes <- grep(tcr_regex, genes, value = TRUE)
+keep_genes <- setdiff(genes, c(tcr_genes, sex_genes))
+
+TCRseq_qc[["RNA2"]] <- subset(TCRseq_qc[["RNA"]], features = keep_genes)
+```
+
+```{r}
+#| label: sct-and-cellcycle
+#| message: false
+#| warning: false
+
+# Cell-cycle scoring on RNA2, then SCT
+
+DefaultAssay(TCRseq_qc) <- "RNA2"
+
+TCRseq_qc <- NormalizeData(TCRseq_qc, verbose = FALSE)
+TCRseq_qc <- FindVariableFeatures(TCRseq_qc, verbose = FALSE)
+
+rna2_feats <- rownames(TCRseq_qc[["RNA2"]])
+s.use <- intersect(s.genes, rna2_feats)
+g.use <- intersect(g2m.genes, rna2_feats)
+
+if (length(s.use) >= 5 && length(g.use) >= 5) {
+  TCRseq_qc <- CellCycleScoring(
+    TCRseq_qc,
+    assay = "RNA2",
+    s.features = s.use,
+    g2m.features = g.use,
+    set.ident = FALSE
+  )
+}
+
+vars_to_regress <- c("percent.mt", "percent.rb")
+if (all(c("S.Score", "G2M.Score") %in% colnames(TCRseq_qc@meta.data))) {
+  vars_to_regress <- c(vars_to_regress, "S.Score", "G2M.Score")
+}
+
+TCRseq_qc <- SCTransform(
+  TCRseq_qc,
+  assay = "RNA2",
+  new.assay.name = "SCT",
+  vst.flavor = "v2",
+  vars.to.regress = vars_to_regress,
+  verbose = FALSE
+)
+
+DefaultAssay(TCRseq_qc) <- "SCT"
+```
+
+```{r}
+#| label: run-pca
+#| message: false
+#| warning: false
+
+# PCA
+
+TCRseq_qc <- RunPCA(
+  TCRseq_qc,
+  assay = "SCT",
+  npcs = 50,
+  verbose = FALSE
+)
+```
+
+```{r}
+#| label: fig-elbowplot
+#| message: false
+#| warning: false
+#| fig-cap: "Elbow plot showing variance explained by the first principal components."
+
+ElbowPlot(TCRseq_qc, ndims = 50)
+```
+
+```{r}
+#| label: choose-pcs
+#| message: false
+#| warning: false
+
+n_pcs_use <- 30
+```
+
+```{r}
+#| label: harmony-integration
+#| message: false
+#| warning: false
+
+TCRseq_qc <- harmony::RunHarmony(
+  object = TCRseq_qc,
+  group.by.vars = "orig.ident",
+  reduction.use = "pca",
+  dims.use = 1:n_pcs_use,
+  reduction.save = "harmony",
+  verbose = TRUE
+)
+
+TCRseq_qc <- RunUMAP(
+  TCRseq_qc,
+  reduction = "harmony",
+  dims = 1:n_pcs_use,
+  verbose = FALSE
+)
+
+TCRseq_qc <- FindNeighbors(
+  TCRseq_qc,
+  reduction = "harmony",
+  dims = 1:n_pcs_use,
+  verbose = FALSE
+)
+
+TCRseq_qc <- FindClusters(
+  TCRseq_qc,
+  resolution = 0.5,
+  verbose = FALSE
+)
+```
+
+The cluster labels generated here were treated as provisional unsupervised partitions for subsequent annotation and refinement rather than as finalized biological identities.
+
+```{r}
+#| label: fig-pca-by-sample
+#| message: false
+#| warning: false
+#| fig-cap: "PCA embedding before Harmony, coloured by sample of origin."
+#| fig-width: 6
+#| fig-height: 5
+#| fig-dpi: 300
+
+DimPlot(
+  TCRseq_qc,
+  reduction = "pca",
+  group.by = "orig.ident"
+)
+```
+
+```{r}
+#| label: fig-umap-harmony-by-sample
+#| message: false
+#| warning: false
+#| fig-cap: "UMAP of the Harmony embedding for QC-filtered cells, coloured by sample of origin."
+#| fig-width: 6
+#| fig-height: 5
+#| fig-dpi: 300
+
+DimPlot(
+  TCRseq_qc,
+  reduction = "umap",
+  group.by = "orig.ident"
+)
+```
+
+```{r}
+#| label: fig-umap-harmony-by-condition
+#| message: false
+#| warning: false
+#| fig-cap: "UMAP of the Harmony embedding for QC-filtered cells, coloured by treatment condition."
+#| fig-width: 6
+#| fig-height: 5
+#| fig-dpi: 300
+
+DimPlot(
+  TCRseq_qc,
+  reduction = "umap",
+  group.by = "Condition"
+)
+```
+
+```{r}
+#| label: fig-umap-harmony-by-cluster
+#| message: false
+#| warning: false
+#| fig-cap: "UMAP of the Harmony embedding, coloured by unsupervised clusters from the working clustering solution."
+#| fig-width: 6
+#| fig-height: 5
+#| fig-dpi: 300
+
+DimPlot(
+  TCRseq_qc,
+  reduction = "umap",
+  group.by = "seurat_clusters",
+  label = TRUE
+)
+```
+
+```{r}
+#| label: fig-umap-harmony-by-cluster-split-sample
+#| message: false
+#| warning: false
+#| fig-cap: "UMAP of the Harmony embedding split by sample and coloured by unsupervised clusters."
+#| fig-width: 12
+#| fig-height: 8
+#| fig-dpi: 300
+
+DimPlot(
+  TCRseq_qc,
+  reduction = "umap",
+  group.by = "seurat_clusters",
+  split.by = "orig.ident",
+  label = FALSE,
+  ncol = 3,
+  pt.size = 0.2
+) + NoLegend()
+```
+
+```{r}
+#| label: fig-umap-harmony-by-cluster-split-condition
+#| message: false
+#| warning: false
+#| fig-cap: "UMAP of the Harmony embedding split by treatment condition and coloured by unsupervised clusters."
+#| fig-width: 10
+#| fig-height: 5
+#| fig-dpi: 300
+
+DimPlot(
+  TCRseq_qc,
+  reduction = "umap",
+  group.by = "seurat_clusters",
+  split.by = "Condition",
+  label = FALSE,
+  pt.size = 0.2
+) + NoLegend()
+```
+
+```{r}
+#| label: save-harmony-integrated
+#| message: false
+#| warning: false
+
+# Saving integrated object
+
+saveRDS(TCRseq_qc, file = "data/TCRseq_qc_harmony_integrated.rds")
+
+# Saving filtered per-sample list (not merged)
+
+saveRDS(TCRseq_list, file = "data/TCRseq_qc_filtered_list.rds")
+
+# Saving recovery table
+saveRDS(cell_recovery_summary, file = "data/cell_recovery_summary_qc.rds")
+```
+
+## Summary
+
+- **Doublets.** Hashtag demultiplexing had already removed cross-mouse multiplets. DoubletFinder, run within each mouse, flagged about 1% of the remaining cells as likely same-mouse doublets, and these were removed. Because the deposited cells had been pre-filtered by the authors, this low rate is expected.
+- **QC thresholds.** No further cells failed the thresholds (more than 300 genes, at most 20% mitochondrial reads, log10 genes per UMI of at least 0.8). The deposited object had also been QC-filtered, so the thresholds act as a check, not as a filter.
+- **Retained cells.** `r scales::comma(ncol(TCRseq_qc))` cells from eight mice were carried forward. The control arm contributes more cells than the TNFR2a arm, so condition-level comparisons later in the book are made per mouse.
+- **Normalisation and integration.** SCTransform v2 normalised the data [@choudhary2022sctransform], with mitochondrial and ribosomal fractions and cell-cycle scores regressed out. TCR and sex genes were excluded from the variable features, so that clonotype and sex do not drive clustering. Harmony integration on mouse [@korsunsky2019harmony] mixed the mice in the shared embedding while keeping clear structure, such as the separated Treg and cycling regions.
+- **Working clusters.** The clusters produced in this chapter are a technical working partition. Clustering is revisited properly in the next chapter.

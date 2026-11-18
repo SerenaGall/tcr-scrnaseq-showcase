@@ -1,0 +1,350 @@
+---
+title: "Preprocessing"
+execute:
+  echo: true
+  message: false
+  warning: false
+---
+
+## Overview
+
+This chapter imports the lung CD4⁺ T-cell dataset, rebuilds per-mouse samples from the hashtag (HTO) labels, re-runs HTO demultiplexing, and reconstructs a contig-level TCR table from the per-cell CDR3 sequences. The output is a single multimodal object in which gene expression, hashtag counts and TCR information are aligned at the barcode level. All later chapters start from this object.
+
+```{r}
+#| label: setup
+#| echo: false
+
+source("R/setup.R")
+source("R/helpers.R")
+```
+
+## Data import
+
+The processed Seurat object deposited with GEO GSE344965 is downloaded on first render. Only the RNA counts, raw HTO counts, QC fractions and TCR CDR3 annotations are carried forward. The authors' normalisation, embeddings and clusters are discarded so that every downstream step is re-derived here. Their cell-type labels are kept in a separate column (`author_label`) for a cross-check in the annotation chapter.
+
+```{r}
+#| label: download-geo
+
+dir.create(dirname(geo_rds_file), recursive = TRUE, showWarnings = FALSE)
+
+if (!file.exists(geo_rds_file)) {
+  options(timeout = 3600)
+  download.file(geo_rds_url, geo_rds_file, mode = "wb")
+}
+
+geo_obj <- readRDS(geo_rds_file)
+geo_obj
+```
+
+```{r}
+#| label: tbl-geo-design
+#| tbl-cap: "Cells per mouse and treatment arm in the deposited object. Mice with a sample name are used in this book."
+
+geo_obj@meta.data %>%
+  dplyr::count(treatment, mouse, name = "n_cells") %>%
+  dplyr::left_join(
+    sample_design %>% dplyr::select(geo_mouse, sample),
+    by = c("mouse" = "geo_mouse")
+  ) %>%
+  dplyr::arrange(treatment, mouse) %>%
+  knitr::kable()
+```
+
+## HTO demultiplexing
+
+All 12 hashtags were pooled in a single 10x library, so demultiplexing is run on the full library before the IL-2 mutein mice are removed. HTO counts are CLR-normalised before assignment [@stoeckius2018hashing].
+
+My usual choice for raw Cell Ranger output is `HTODemux`. It models each hashtag's background from the negative cluster, but the deposited object contains only cells the authors had already called as singlets, so there is almost no true background to fit. On this input `HTODemux` either fails to fit the negative-binomial background or, with k-means initialisation, labels about 40% of cells as doublets. `MULTIseqDemux`, which picks per-hashtag thresholds automatically, is better suited to pre-filtered cells and is used here. This step mainly checks that the hashtag assignment can be reproduced.
+
+```{r}
+#| label: hto-demultiplexing
+
+hto_counts <- SeuratObject::LayerData(geo_obj, assay = "HTO", layer = "counts")
+
+hto_obj <- CreateSeuratObject(counts = hto_counts, assay = "HTO")
+hto_obj <- NormalizeData(hto_obj, assay = "HTO", normalization.method = "CLR", verbose = FALSE)
+hto_obj <- MULTIseqDemux(hto_obj, assay = "HTO", autoThresh = TRUE, verbose = FALSE)
+
+hto_calls <- hto_obj@meta.data %>%
+  tibble::rownames_to_column("geo_cell") %>%
+  dplyr::transmute(
+    geo_cell,
+    HTO_maxID = as.character(MULTI_ID),
+    HTO_classification = as.character(MULTI_ID),
+    HTO_classification.global = dplyr::case_when(
+      MULTI_ID == "Doublet" ~ "Doublet",
+      MULTI_ID == "Negative" ~ "Negative",
+      TRUE ~ "Singlet"
+    ),
+    HTO_margin = NA_real_
+  )
+```
+
+```{r}
+#| label: tbl-hto-agreement
+#| tbl-cap: "Agreement between MULTIseqDemux calls in this book and the authors' hashtag assignment (all 12 mice)."
+
+hto_agreement <- hto_calls %>%
+  dplyr::mutate(author_hto = geo_obj$HTO_maxID[match(geo_cell, colnames(geo_obj))]) %>%
+  dplyr::summarise(
+    n_cells = dplyr::n(),
+    singlet = sum(HTO_classification.global == "Singlet"),
+    doublet = sum(HTO_classification.global == "Doublet"),
+    negative = sum(HTO_classification.global == "Negative"),
+    same_maxID_as_authors = mean(HTO_maxID == author_hto)
+  )
+
+knitr::kable(hto_agreement, digits = 3)
+```
+
+```{r}
+#| label: fig-hto-ridge
+#| fig-cap: "CLR-normalised hashtag signal grouped by the assigned hashtag. Each hashtag shows a clear positive population separated from background."
+#| fig-width: 11
+#| fig-height: 8
+
+Idents(hto_obj) <- "MULTI_ID"
+RidgePlot(hto_obj, assay = "HTO", features = rownames(hto_obj[["HTO"]]), ncol = 4) &
+  theme(axis.title = element_blank(), axis.text.y = element_text(size = 6))
+```
+
+## Recovering raw counts
+
+The RNA `counts` layer of the deposited object is an on-disk BPCells matrix that points to a directory on the authors' server, so it cannot be read. The object also contains a `CPM` assay, where each value is a raw count divided by the cell's library size and multiplied by 10⁶. In sparse UMI data the smallest non-zero count in a cell is 1, so the smallest non-zero CPM value in each cell equals 10⁶ / library size. Dividing each cell's CPM values by that minimum gives back the integer UMI counts exactly. The CPM matrix also contains the 12 hashtag features; these are removed from the gene-expression counts, because the hashtags are analysed in their own HTO assay.
+
+```{r}
+#| label: recover-counts
+
+recover_counts_from_cpm <- function(obj) {
+  cpm <- SeuratObject::LayerData(obj, assay = "CPM", layer = "counts")
+  cpm <- methods::as(cpm, "CsparseMatrix")
+  # smallest non-zero CPM per cell corresponds to a single UMI
+  cell_min <- vapply(
+    seq_len(ncol(cpm)),
+    function(j) min(cpm@x[(cpm@p[j] + 1):cpm@p[j + 1]]),
+    numeric(1)
+  )
+  counts <- cpm %*% Matrix::Diagonal(x = 1 / cell_min)
+  stopifnot(max(abs(counts@x - round(counts@x))) < 1e-6)
+  counts@x <- round(counts@x)
+  dimnames(counts) <- dimnames(cpm)
+  # the deposited matrix also carries the 12 hashtag features: keep genes only
+  counts <- counts[!grepl("^HTO-", rownames(counts)), ]
+  methods::as(counts, "CsparseMatrix")
+}
+
+counts_check <- recover_counts_from_cpm(geo_obj)
+
+tibble::tibble(
+  genes = nrow(counts_check),
+  cells = ncol(counts_check),
+  all_integer = TRUE,
+  median_UMIs_per_cell = median(Matrix::colSums(counts_check)),
+  mitochondrial_genes = sum(grepl("^mt-", rownames(counts_check))),
+  ribosomal_protein_genes = sum(grepl("^Rp[sl][0-9]", rownames(counts_check)))
+) %>%
+  knitr::kable(caption = "Recovered count matrix.")
+
+rm(counts_check)
+```
+
+The recovered matrix is integer-valued for every cell. The authors removed mitochondrial and ribosomal-protein genes before computing CPM, so these genes are absent. Their per-cell mitochondrial and ribosomal fractions, computed before removal, are kept in the metadata as `percent.mt` and `percent.rb` and used for QC in the next chapter.
+
+## Building the per-mouse analysis object
+
+Cells from the control and TNFR2 agonist arms are kept and renamed to `Ctrl_1`–`Ctrl_4` and `TNFR2a_1`–`TNFR2a_4`. Each cell is named `<10x barcode>_<k>`, where `k` is the sample index. This matches the barcode convention of a merged multi-sample Seurat object, so the TCR chapters can join contigs to cells by sample and barcode.
+
+```{r}
+#| label: build-analysis-object
+
+md_geo <- geo_obj@meta.data %>%
+  tibble::rownames_to_column("geo_cell") %>%
+  dplyr::inner_join(sample_design, by = c("mouse" = "geo_mouse", "treatment" = "geo_treatment")) %>%
+  dplyr::mutate(
+    barcode_10x = paste0(sub(".*_", "", cellName), "-1"),
+    cell = paste0(barcode_10x, suffix)
+  )
+
+stopifnot(!anyDuplicated(md_geo$cell))
+
+rna_counts <- recover_counts_from_cpm(geo_obj)[, md_geo$geo_cell]
+colnames(rna_counts) <- md_geo$cell
+
+hto_use <- hto_counts[, md_geo$geo_cell]
+colnames(hto_use) <- md_geo$cell
+
+TCRseq.merged <- CreateSeuratObject(counts = rna_counts, assay = "RNA", min.cells = 0, min.features = 0)
+TCRseq.merged[["HTO"]] <- CreateAssayObject(counts = hto_use)
+
+cell_meta <- md_geo %>%
+  dplyr::select(-dplyr::starts_with("HTO_")) %>%
+  dplyr::left_join(hto_calls, by = "geo_cell") %>%
+  dplyr::transmute(
+    cell,
+    orig.ident = factor(sample, levels = sample_levels),
+    Condition = factor(Condition, levels = cond_levels),
+    geo_mouse = mouse,
+    barcode_10x,
+    HTO_maxID,
+    HTO_classification,
+    HTO_classification.global,
+    HTO_margin,
+    percent.mt = 100 * percentMito,
+    percent.rb = 100 * percentRibo,
+    author_label = Identity
+  ) %>%
+  tibble::column_to_rownames("cell")
+
+TCRseq.merged <- AddMetaData(TCRseq.merged, cell_meta[colnames(TCRseq.merged), ])
+Idents(TCRseq.merged) <- "orig.ident"
+TCRseq.merged
+```
+
+## Reconstructing TCR contigs
+
+GEO provides one TCR string per cell (for example `TRB:CASSSGQNTEVFF;TRA:CAASGNTNTGKLTF`) instead of Cell Ranger's `filtered_contig_annotations.csv`. These strings are expanded into a contig-level table with one row per chain, using the same columns as Cell Ranger (`barcode`, `chain`, `cdr3`, `productive`). The list of per-sample tables (`vdj_contigs_list`) is the input that the TCR chapters expect. Only productive CDR3 amino-acid sequences were deposited, so V/J gene calls and UMI counts are not available.
+
+```{r}
+#| label: reconstruct-contigs
+
+vdj_contigs_all <- md_geo %>%
+  dplyr::filter(!is.na(cdr3s_aa), cdr3s_aa != "") %>%
+  dplyr::select(sample, barcode_10x, cdr3s_aa) %>%
+  tidyr::separate_rows(cdr3s_aa, sep = ";") %>%
+  tidyr::separate(cdr3s_aa, into = c("chain", "cdr3"), sep = ":") %>%
+  dplyr::group_by(sample, barcode_10x) %>%
+  dplyr::mutate(contig_id = paste0(barcode_10x, "_contig_", dplyr::row_number())) %>%
+  dplyr::ungroup() %>%
+  dplyr::transmute(
+    sample,
+    barcode = barcode_10x,
+    contig_id,
+    chain,
+    cdr3,
+    productive = TRUE,
+    high_confidence = TRUE,
+    full_length = TRUE
+  )
+
+vdj_contigs_list <- split(vdj_contigs_all, vdj_contigs_all$sample)[sample_levels]
+
+make_vdj_barcode_summary <- function(contigs_df) {
+  contigs_df %>%
+    dplyr::group_by(sample, barcode) %>%
+    dplyr::summarise(
+      t_cdr3s_aa = paste(paste0(chain, ":", cdr3), collapse = ";"),
+      t_chain = paste(sort(unique(chain)), collapse = ";"),
+      t_n_contigs = dplyr::n(),
+      t_n_TRA = sum(chain == "TRA"),
+      t_n_TRB = sum(chain == "TRB"),
+      .groups = "drop"
+    )
+}
+
+vdj_barcode_summary <- make_vdj_barcode_summary(vdj_contigs_all)
+
+md <- TCRseq.merged@meta.data %>%
+  tibble::rownames_to_column("cell") %>%
+  dplyr::mutate(sample = as.character(orig.ident)) %>%
+  dplyr::left_join(vdj_barcode_summary, by = c("sample", "barcode_10x" = "barcode")) %>%
+  dplyr::select(-sample) %>%
+  tibble::column_to_rownames("cell")
+
+TCRseq.merged@meta.data <- md[colnames(TCRseq.merged), ]
+TCRseq.merged@misc$vdj_contigs <- vdj_contigs_all
+```
+
+```{r}
+#| label: tbl-vdj-import-summary
+#| tbl-cap: "TCR recovery per sample after contig reconstruction."
+
+vdj_import_summary <- TCRseq.merged@meta.data %>%
+  dplyr::group_by(orig.ident, Condition) %>%
+  dplyr::summarise(
+    n_cells = dplyr::n(),
+    n_cells_with_tcr = sum(!is.na(t_cdr3s_aa)),
+    pct_with_tcr = mean(!is.na(t_cdr3s_aa)),
+    pct_paired_TRA_TRB = mean(t_n_TRA %in% 1:9 & t_n_TRB %in% 1:9),
+    pct_multi_chain = mean(t_n_TRA %in% 2:9 | t_n_TRB %in% 2:9),
+    .groups = "drop"
+  )
+
+knitr::kable(vdj_import_summary, digits = 3)
+```
+
+## Raw data overview
+
+```{r}
+#| label: fig-qc-feature-scatter
+#| fig-cap: "Total UMI counts versus detected genes per cell, coloured by sample."
+#| fig-width: 7
+#| fig-height: 5
+
+FeatureScatter(
+  TCRseq.merged,
+  feature1 = "nCount_RNA",
+  feature2 = "nFeature_RNA",
+  group.by = "orig.ident",
+  shuffle = TRUE,
+  pt.size = 0.3
+)
+```
+
+```{r}
+#| label: fig-qc-vln-hto
+#| fig-cap: "Distribution of RNA and HTO counts per cell across samples."
+#| fig-width: 10
+#| fig-height: 4
+
+VlnPlot(
+  TCRseq.merged,
+  features = c("nCount_RNA", "nFeature_RNA", "nCount_HTO"),
+  group.by = "orig.ident",
+  pt.size = 0,
+  ncol = 3
+) & theme(axis.title.x = element_blank())
+```
+
+```{r}
+#| label: tbl-hto-summary
+#| tbl-cap: "Hashtag demultiplexing outcome per sample for the cells carried forward."
+
+hto_summary <- TCRseq.merged@meta.data %>%
+  dplyr::group_by(orig.ident) %>%
+  dplyr::summarise(
+    n_cells_total = dplyr::n(),
+    n_singlet = sum(HTO_classification.global == "Singlet"),
+    n_doublet = sum(HTO_classification.global == "Doublet"),
+    n_negative = sum(HTO_classification.global == "Negative"),
+    prop_singlet = n_singlet / n_cells_total
+  )
+
+knitr::kable(hto_summary, digits = 3)
+```
+
+## Note on ambient RNA correction
+
+In my standard workflow, ambient RNA is removed per library with SoupX, using paired raw (all droplets) and filtered Cell Ranger matrices. The deposited object contains only called cells and no empty droplets, so the ambient profile cannot be estimated and SoupX is not applied here. Ambient contamination is instead monitored downstream through checks for implausible marker co-expression in the annotation chapters.
+
+## Saving objects
+
+```{r}
+#| label: save-preprocessed-objects
+
+TCRseq.list <- SplitObject(TCRseq.merged, split.by = "orig.ident")
+
+saveRDS(TCRseq.list, file = "data/TCRseq_list_preprocessed.rds")
+saveRDS(TCRseq.merged, file = "data/TCRseq_merged_preprocessed.rds")
+saveRDS(hto_summary, file = "data/hto_summary_preprocessed.rds")
+saveRDS(vdj_contigs_list, file = "data/vdj_contigs_list.rds")
+saveRDS(vdj_barcode_summary, file = "data/vdj_barcode_summary.rds")
+saveRDS(vdj_import_summary, file = "data/vdj_import_summary.rds")
+
+pct_hto_match <- hto_agreement$same_maxID_as_authors
+rm(geo_obj, hto_obj, rna_counts)
+invisible(gc())
+```
+
+## Summary
+
+The analysis object contains `r scales::comma(ncol(TCRseq.merged))` lung CD4⁺ T cells from eight mice. Re-running hashtag demultiplexing reproduced the authors' hashtag assignment for `r scales::percent(pct_hto_match, accuracy = 0.1)` of cells. At least one productive TCR chain was recovered for `r scales::percent(mean(!is.na(TCRseq.merged$t_cdr3s_aa)), accuracy = 0.1)` of cells. RNA, HTO and TCR information are aligned at the barcode level, and the contig table uses the Cell Ranger column layout so the same clonotype code applies to public and in-house data.

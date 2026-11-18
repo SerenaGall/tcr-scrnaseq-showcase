@@ -1,0 +1,46 @@
+project:
+  type: book
+  output-dir: _book
+
+execute:
+  freeze: auto
+
+book:
+  title: "Lung CD4⁺ T cells under TNFR2 agonism"
+  subtitle: "A single-cell RNA + TCR-seq analysis workflow"
+  author: "Serena Gallozzi, PhD"
+  date: last-modified
+  repo-url: https://github.com/SerenaGall/tcr-scrnaseq-showcase
+  repo-actions: [source, issue]
+  site-url: https://serenagall.github.io/tcr-scrnaseq-showcase/
+  search: true
+  chapters:
+    - index.qmd
+    - part: "Data processing"
+      chapters:
+        - Preprocessing.qmd
+        - QC_and_Integration.qmd
+        - Dimensionality_reduction.qmd
+    - part: "Cell states"
+      chapters:
+        - Clustering_annotation.qmd
+        - Revised_clustering.qmd
+    - part: "Repertoire and expression"
+      chapters:
+        - TCR_clonotype_analysis.qmd
+        - Differential_expression.qmd
+        - Clonotype-informed_differential_expression_analysis.qmd
+        - Pathway_analysis.qmd
+        - Trajectory.qmd
+    - references.qmd
+
+bibliography: references.bib
+
+format:
+  html:
+    css: styles.css
+    theme: flatly
+    toc: true
+    code-fold: true
+    code-tools: true
+    fig-format: png

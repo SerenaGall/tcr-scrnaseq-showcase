@@ -1,0 +1,372 @@
+---
+title: "Dimensionality reduction"
+execute: 
+  echo: true
+  message: false
+  warning: false
+
+---
+
+```{r}
+#| label: setup
+#| message: false
+#| warning: false
+
+source("R/setup.R")
+source("R/helpers.R")
+```
+
+## Overview
+
+This chapter defines the working low-dimensional representation and initial clustering structure used for downstream analysis. Starting from the QC-filtered and Harmony-integrated dataset, the goal here is to evaluate how cells organise in the integrated space, assess clustering behaviour across a range of Leiden resolutions, and select a provisional high-resolution clustering that can serve as a scaffold for downstream annotation.
+
+Unlike the QC and integration chapter, which focuses on technical filtering and normalization, this section focuses on structure: how cells group together in the integrated embedding, how stable those groupings remain across clustering resolutions, and whether the resulting partitions capture biologically meaningful heterogeneity. Importantly, the clustering defined here is not treated as a final set of cell identities. Instead, it is used as a deliberately granular working solution that can be annotated, reviewed, and subsequently consolidated.
+
+This chapter therefore serves as a bridge between technical preprocessing and biological interpretation. The outputs generated here—UMAP embeddings, provisional cluster assignments, and cluster-defining marker genes—provide the organisational framework for the subsequent annotation chapter, after which the clustering is further refined in the revised clustering workflow.
+
+```{r}
+#| label: load-harmony-object
+#| message: false
+#| warning: false
+
+TCRseq_integrated <- readRDS("data/TCRseq_qc_harmony_integrated.rds")
+
+dims_use <- 1:30
+seed_use <- 42
+```
+
+## Condition metadata
+
+Condition is re-derived from the sample name (`Ctrl_*` or `TNFR2a_*`) so that this chapter can be run on its own.
+
+```{r}
+#| label: add-condition-metadata
+#| message: false
+#| warning: false
+
+# Recreate Condition metadata to keep this chapter self-contained
+
+TCRseq_integrated$Condition <- ifelse(
+  grepl("^TNFR2a_", TCRseq_integrated$orig.ident),
+  "TNFR2a",
+  ifelse(grepl("^Ctrl_", TCRseq_integrated$orig.ident), "Control", NA_character_)
+)
+
+TCRseq_integrated$Condition <- factor(TCRseq_integrated$Condition, levels = c("Control", "TNFR2a"))
+
+```
+
+## PCA and UMAP QC plots
+
+```{r}
+#| label: fig-pca-by-sample
+#| fig-cap: "PCA of the QC-filtered SCTransformed dataset coloured by sample of origin (orig.ident), shown before Harmony correction to assess the extent of sample-specific structure in the PCA space."
+#| message: false
+#| warning: false
+#| fig-width: 7
+#| fig-height: 5
+#| fig-dpi: 300
+
+DimPlot(TCRseq_integrated, reduction = "pca", group.by = "orig.ident")
+
+```
+
+```{r}
+#| label: fig-umap-by-sample
+#| fig-cap: "UMAP of the Harmony embedding coloured by sample of origin (orig.ident), shown as a descriptive view of sample representation in the integrated space."
+#| message: false
+#| warning: false
+#| fig-width: 7
+#| fig-height: 5
+#| fig-dpi: 300
+
+DimPlot(
+  TCRseq_integrated,
+  reduction = "umap",
+  group.by  = "orig.ident",
+  pt.size   = 0.2,
+  shuffle   = TRUE
+)
+
+```
+
+```{r}
+#| label: fig-umap-split-by-condition
+#| fig-cap: "UMAP of the Harmony embedding coloured by sample of origin and split by condition (Control versus TNFR2a), shown as a descriptive view of sample representation within each treatment group."
+#| message: false
+#| warning: false
+#| fig-width: 10
+#| fig-height: 5
+#| fig-dpi: 300
+
+DimPlot(
+  TCRseq_integrated,
+  reduction = "umap",
+  group.by  = "orig.ident",
+  split.by  = "Condition",
+  pt.size   = 0.2
+)
+
+```
+
+## Leiden resolution sweep
+
+In the Leiden sweep section, the same neighbour graph/embedding is reused while the Leiden community detection is run repeatedly across a grid of resolution parameters to quantify how cluster structure changes with granularity. The clustree visualisation summarises cluster “splits” and “merges” across resolutions, providing an auditable basis for selecting a resolution that balances biological interpretability and avoidance of over-partitioning [@traag2019leiden, @zappia2018clustree].
+
+```{r}
+#| label: leiden-resolution-sweep
+#| message: false
+#| warning: false
+
+# Clear previous sweep columns to avoid confusion on re-runs
+meta <- TCRseq_integrated@meta.data
+drop_cols <- grep("^leiden_res_", colnames(meta), value = TRUE)
+if (length(drop_cols) > 0) {
+  TCRseq_integrated@meta.data <- meta[, setdiff(colnames(meta), drop_cols), drop = FALSE]
+}
+
+# Resolution grid
+res_grid <- seq(0.1, 1.2, by = 0.1)
+
+for (res in res_grid) {
+  lab <- sprintf("leiden_res_%.1f", res)
+
+  TCRseq_integrated <- FindClusters(
+    TCRseq_integrated,
+    algorithm   = 4,
+    resolution  = res,
+    random.seed = seed_use,
+    verbose     = FALSE
+  )
+
+  TCRseq_integrated[[lab]] <- Idents(TCRseq_integrated)
+}
+
+p_ct <- clustree::clustree(TCRseq_integrated, prefix = "leiden_res_")
+```
+
+```{r}
+#| label: set-primary-clustering
+#| message: false
+#| warning: false
+
+# Provisional working resolution for downstream review
+primary_res <- 1.1
+primary_col <- sprintf("leiden_res_%.1f", primary_res)
+
+stopifnot(primary_col %in% colnames(TCRseq_integrated@meta.data))
+
+TCRseq_integrated$cluster_primary <- as.factor(TCRseq_integrated@meta.data[[primary_col]])
+Idents(TCRseq_integrated) <- "cluster_primary"
+```
+
+To guide selection of a provisional high-resolution working clustering was selected, Leiden clustering was repeated across a grid of resolution parameters and summarised using clustree. This representation shows how clusters split and persist as resolution increases, allowing identification of stable cluster structure while avoiding unnecessary over-partitioning. Resolutions were evaluated based on cluster stability, biological interpretability, and consistency with marker gene expression.
+
+```{r}
+#| label: fig-clustree-leiden
+#| fig-cap: "Clustree visualisation of Leiden clustering across a resolution sweep (0.1–1.2)."
+#| message: false
+#| warning: false
+#| fig-width: 7
+#| fig-height: 10
+#| fig-dpi: 300
+
+p_ct
+
+```
+
+```{r}
+#| label: tbl-cluster-sample-composition
+#| message: false
+#| warning: false
+#| tbl-cap: "Cell counts per sample for the provisional working clustering."
+
+comp_tab <- table(
+  Cluster = TCRseq_integrated$cluster_primary,
+  Sample  = TCRseq_integrated$orig.ident
+)
+
+knitr::kable(as.data.frame.matrix(comp_tab))
+```
+
+Because cell recovery differed across samples and conditions in the QC-filtered dataset, cluster composition was interpreted descriptively at this stage and not as formal evidence of differential abundance.
+
+```{r}
+#| label: save-postprimary-clustering
+#| message: false
+#| warning: false
+
+# Integrated object with primary clustering stored in metadata and Idents set
+saveRDS(
+  TCRseq_integrated,
+  file = "data/TCRseq_integrated_cluster_primary_res1.1.rds"
+)
+
+```
+
+## Cluster visualisation (res. 1.1)
+
+The resolution 1.1 solution was retained as a provisional high-resolution working clustering (`cluster_primary`) for downstream annotation, with the expectation that biologically related clusters would later be merged or removed during clustering refinement.
+
+```{r}
+#| label: fig-umap-primary-clusters
+#| fig-cap: "UMAP embedding coloured by Leiden clusters for the provisional working resolution."
+#| message: false
+#| warning: false
+#| fig-width: 7
+#| fig-height: 5
+#| fig-dpi: 300
+
+DimPlot(
+  TCRseq_integrated,
+  reduction = "umap",
+  group.by  = "cluster_primary",
+  label     = TRUE,
+  repel     = TRUE,
+  shuffle   = TRUE,
+  pt.size   = 0.2
+)
+```
+
+```{r}
+#| label: fig-umap-primary-bysample
+#| fig-cap: "UMAP embeddings split by sample (orig.ident), coloured by Leiden clusters at resolution 1.1."
+#| message: false
+#| warning: false
+#| fig-width: 12
+#| fig-height: 8
+#| fig-dpi: 300
+
+DimPlot(
+  TCRseq_integrated,
+  reduction = "umap",
+  group.by  = "cluster_primary",
+  split.by  = "orig.ident",
+  label     = TRUE,
+  repel     = TRUE,
+  shuffle   = TRUE,
+  ncol      = 3
+) + NoLegend()
+
+```
+
+```{r}
+#| label: fig-umap-by-phase-split-by-sample-res1.1
+#| fig-cap: "UMAP embeddings split by sample (orig.ident), coloured by cell-cycle phase."
+#| message: false
+#| warning: false
+#| fig-width: 12
+#| fig-height: 8
+#| fig-dpi: 300
+
+DimPlot(
+  TCRseq_integrated,
+  reduction = "umap",
+  group.by  = "Phase",
+  split.by  = "orig.ident",
+  shuffle   = TRUE,
+  ncol      = 3
+)
+
+```
+
+## 3D UMAP
+
+```{r}
+#| label: umap-3d-calculation
+#| message: false
+#| warning: false
+
+TCRseq_integrated <- Seurat::RunUMAP(
+  TCRseq_integrated,
+  reduction = "harmony",
+  dims = dims_use,
+  n.components = 3,
+  reduction.name = "umap3d",
+  reduction.key  = "UMAP3D_",
+  seed.use = seed_use
+)
+
+```
+
+```{r}
+#| label: fig-umap3d-by-cluster-res1.1
+#| fig-cap: "Interactive 3D UMAP coloured by Leiden clusters at resolution 1.1."
+#| message: false
+#| warning: false
+
+umap_df <- as.data.frame(Seurat::Embeddings(TCRseq_integrated, reduction = "umap3d"))
+colnames(umap_df)[1:3] <- c("UMAP_1","UMAP_2","UMAP_3")
+umap_df$cluster <- TCRseq_integrated$cluster_primary
+
+plotly::plot_ly(
+  umap_df,
+  x = ~UMAP_1, y = ~UMAP_2, z = ~UMAP_3,
+  color = ~cluster,
+  type = "scatter3d", mode = "markers",
+  marker = list(size = 2)
+)
+
+```
+
+## Marker gene identification for the provisional working clustering
+
+These marker genes were used as descriptive cluster-defining features to support downstream annotation and were not interpreted as condition-level differential expression results.
+
+```{r}
+#| label: find-markers-primary
+#| message: false
+#| warning: false
+
+DefaultAssay(TCRseq_integrated) <- "SCT"
+Idents(TCRseq_integrated) <- "cluster_primary"
+
+# Ensure all SCT models reference the same raw UMI assay
+# (required when multiple SCT models were created across samples)
+
+for (i in seq_along(TCRseq_integrated[["SCT"]]@SCTModel.list)) {
+  slot(TCRseq_integrated[["SCT"]]@SCTModel.list[[i]], "umi.assay") <- "RNA2"
+}
+
+# Run sequentially to avoid future.globals.maxSize errors
+future::plan("sequential")
+
+# Re-correct SCT counts across models prior to DE testing
+TCRseq_integrated <- PrepSCTFindMarkers(
+  TCRseq_integrated,
+  assay = "SCT",
+  verbose = TRUE
+)
+
+# Identify cluster markers
+DEGS_cluster_primary <- FindAllMarkers(
+  object = TCRseq_integrated,
+  assay = "SCT",
+  test.use = "wilcox",
+  logfc.threshold = 0.1,
+  min.pct = 0.05,
+  only.pos = TRUE,
+  verbose = TRUE
+)
+```
+
+```{r}
+#| label: save-degs-primary
+#| message: false
+#| warning: false
+
+saveRDS(DEGS_cluster_primary, file = "data/DEGS_cluster_primary_res1.1.rds")
+readr::write_csv(DEGS_cluster_primary, file = "data/DEGS_cluster_primary_res1.1.csv")
+
+saveRDS(
+  TCRseq_integrated,
+  file = "data/TCRseq_integrated_cluster_primary.rds"
+)
+```
+
+## Summary
+
+- **Embedding.** PCA before Harmony shows some mouse-related structure. After Harmony, all eight mice occupy the same regions of the UMAP. Both treatment arms cover the same overall landscape, but the TNFR2a arm is visibly denser in the Treg and cycling regions, which is the first hint of a treatment-driven shift in composition.
+- **Resolution sweep.** The Leiden sweep [@traag2019leiden] summarised with clustree [@zappia2018clustree] shows a stable coarse structure (naive, Treg, effector and cycling compartments) that splits progressively as resolution increases. Resolution 1.1 (17 clusters) was kept as a deliberately granular working partition. Over-partitioned clusters are merged in the refinement chapter.
+- **Cell cycle.** Cycling cells form a distinct island. Elsewhere in the embedding, cell-cycle phase is mixed, consistent with the regression in the previous chapter.
+- **Markers.** Cluster markers from `FindAllMarkers` (on SCT data, after `PrepSCTFindMarkers`) are descriptive features for annotation and are not used as evidence of treatment effects.

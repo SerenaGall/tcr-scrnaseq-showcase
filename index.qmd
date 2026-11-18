@@ -1,0 +1,50 @@
+# Preface {.unnumbered}
+
+This book is a worked, end-to-end analysis of single-cell RNA sequencing with paired T-cell receptor (TCR) sequencing, built from the workflow I use for CD4⁺ T-cell projects. Every chapter is fully reproducible from public data. Code is folded under each figure: click **Code** to expand it.
+
+## Dataset
+
+The analysis uses the public dataset [GEO GSE344965](https://www.ncbi.nlm.nih.gov/geo/query/acc.cgi?acc=GSE344965), lung CD4⁺ T cells from mice treated with a TNFR2 agonist or a control VHH. In the original study, eight- to ten-week-old female C57BL/6 mice received 3 mg/kg TNFR2 agonist (i.v.), 1 mg/kg IL-2 mutein (s.c.) or 3 mg/kg control VHH (i.v.), and lungs were collected five days later. CD4⁺ T cells from 12 mice were hashtag-multiplexed and profiled on a single 10x Genomics GEM-X 5′ library with gene expression, hashtag (HTO) and V(D)J-T libraries.
+
+This book compares the **TNFR2 agonist** arm with the **control** arm (four mice each). The IL-2 mutein arm is excluded to keep a clean two-group, replicate-aware design.
+
+| Condition | Treatment | Mice (GEO label) | Samples in this book |
+|---|---|---|---|
+| Control | Control VHH, 3 mg/kg i.v. | M01–M04 | Ctrl_1 – Ctrl_4 |
+| TNFR2a | TNFR2 agonist, 3 mg/kg i.v. | M05–M08 | TNFR2a_1 – TNFR2a_4 |
+
+: Study design used in this book {#tbl-design}
+
+GEO provides the authors' processed Seurat object rather than raw Cell Ranger outputs, so the workflow starts from their raw RNA and HTO counts and per-cell TCR CDR3 sequences. All downstream steps (QC, normalisation, integration, clustering, annotation, clonotype reconstruction, differential expression, pathway and trajectory analysis) are re-run here from those counts.
+
+## Questions
+
+1. Which CD4⁺ T-cell states are present in the lung, and how does TNFR2 agonism shift their composition?
+2. Does TNFR2 agonism drive clonal expansion, and in which states do expanded clones reside?
+3. Which transcriptional programs change with treatment, assessed with replicate-aware pseudobulk models?
+4. How do clonal expansion and treatment interact at the level of gene expression and pathways?
+
+## Workflow
+
+| Chapter | Main methods |
+|---|---|
+| Preprocessing | Data import, HTO demultiplexing (HTODemux), TCR contig reconstruction |
+| QC and integration | DoubletFinder, QC filtering, SCTransform v2, Harmony |
+| Dimensionality reduction | Leiden resolution sweep, clustree, marker detection |
+| Clustering and annotation | Canonical marker review, composition per mouse |
+| Refined clustering | Curated state labels |
+| TCR clonotype analysis | Chain-aware clonotypes, expansion, sharing, CDR3 motifs |
+| Differential expression | Pseudobulk edgeR quasi-likelihood per state |
+| Clonotype-informed DE | Expanded vs singleton, treatment within expanded clones |
+| Pathway analysis | ORA and GSEA (KEGG, Reactome, GO BP) |
+| Trajectory | Slingshot and tradeSeq |
+
+## Reproducing the analysis
+
+```bash
+git clone https://github.com/SerenaGall/tcr-scrnaseq-showcase
+cd tcr-scrnaseq-showcase
+quarto render
+```
+
+The first chapter downloads the GEO object (~530 MB) into `data/raw/`. Rendered outputs are stored in `_freeze/`, so the website can be rebuilt without re-running the analysis.

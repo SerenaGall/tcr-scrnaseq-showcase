@@ -1,0 +1,1440 @@
+---
+title: "Pathway analysis"
+execute:
+  echo: true
+  message: false
+  warning: false
+
+---
+
+```{r}
+#| label: setup
+#| message: false
+#| warning: false
+
+source("R/setup.R")
+source("R/helpers.R")
+```
+
+## Overview
+
+Pathway analysis was performed to interpret treatment-associated transcriptional changes between TNFR2a and Control across refined CD4 T-cell states. The primary pathway analysis uses the replicate-aware pseudobulk differential expression results from the preceding chapter, because these models aggregate raw counts at the sample-within-state level and provide the most robust basis for condition-level inference.
+
+Two complementary enrichment strategies were used. Over-representation analysis (ORA) was applied to significant pseudobulk differentially expressed genes within each refined state and direction of regulation. Gene set enrichment analysis (GSEA) was applied to ranked pseudobulk gene-level statistics without imposing a significance threshold, allowing pathway-level shifts to be detected even when individual genes do not all pass a discrete FDR cutoff.
+
+Over-representation analysis (ORA) was performed using clusterProfiler and ReactomePA, with Benjamini–Hochberg correction applied to control the false discovery rate. For each refined state, the background universe consisted of all genes tested in the corresponding pseudobulk differential expression model that were successfully mapped to Entrez identifiers, ensuring that enrichment tests were conditioned on the genes actually assessed for differential expression.
+
+Gene set enrichment analysis (GSEA) was performed using ranked gene-level statistics derived from pseudobulk differential expression. Genes were ranked by a signed statistic (sign(logFC) × −log10(P value)), which captures both direction and strength of evidence while avoiding arbitrary significance thresholds. Gene sets were constrained to sizes between 10 and 500 genes to balance sensitivity and robustness to small or overly broad categories.
+
+Together, these approaches provide complementary perspectives: ORA highlights pathways over-represented among strongly differentially expressed genes, while GSEA detects coordinated but potentially modest shifts across entire gene sets.
+
+Single-cell differential expression results are not used as the primary pathway input because they treat cells as independent observations. Where available, single-cell pathway analysis is therefore included only as an optional exploratory supplement.
+
+```{r}
+#| label: pathway-parameters
+#| message: false
+#| warning: false
+
+state_levels <- state_levels_all
+
+state_labels <- state_labels_all
+
+primary_fdr_col <- "FDR_cluster"
+primary_fdr_cutoff <- 0.05
+min_genes_ora <- 5
+min_gs_size <- 10
+max_gs_size <- 500
+plot_fdr_cutoff <- 0.05
+top_n_plot <- 10
+
+output_dir <- "output"
+dir.create(output_dir, showWarnings = FALSE, recursive = TRUE)
+```
+
+```{r}
+#| label: pathway-helper-functions
+#| message: false
+#| warning: false
+
+sym2ent_mm <- function(symbols) {
+  mapped <- AnnotationDbi::mapIds(
+    org.Mm.eg.db,
+    keys = unique(as.character(symbols)),
+    column = "ENTREZID",
+    keytype = "SYMBOL",
+    multiVals = "first"
+  )
+  unique(stats::na.omit(unname(mapped)))
+}
+
+sym2ent_mm_vec <- function(symbols) {
+  symbols <- as.character(symbols)
+  mapped <- AnnotationDbi::mapIds(
+    org.Mm.eg.db,
+    keys = symbols,
+    column = "ENTREZID",
+    keytype = "SYMBOL",
+    multiVals = "first"
+  )
+  unname(mapped)
+}
+
+clean_pathway_name <- function(x) {
+  x %>%
+    stringr::str_remove(" - Mus musculus.*$") %>%
+    stringr::str_remove("\\s*\\(Mus musculus\\)$")
+}
+
+safe_ratio_to_numeric <- function(x) {
+  purrr::map_dbl(x, function(z) {
+    parts <- strsplit(as.character(z), "/", fixed = TRUE)[[1]]
+    if (length(parts) != 2) return(NA_real_)
+    as.numeric(parts[1]) / as.numeric(parts[2])
+  })
+}
+
+empty_tbl <- function() tibble::tibble()
+
+plot_empty <- function(label) {
+  graphics::plot.new()
+  graphics::text(0.5, 0.5, label, cex = 1.1)
+}
+
+get_state_label <- function(state) {
+  lab <- unname(state_labels[as.character(state)])
+  ifelse(is.na(lab) | lab == "", as.character(state), lab)
+}
+```
+
+## Pseudobulk differential expression input
+
+The pathway analysis uses the pseudobulk edgeR results exported by the differential expression chapter. Positive log fold-change values indicate higher expression in TNFR2a relative to Control, whereas negative values indicate higher expression in Control.
+
+The differential expression chapter found genes that change in the same direction in many states, such as higher *Ikzf2* and lower *Bach2*, *Satb1* and *Klf2*. When a shared shift is suspected to be technical, for example a batch difference that coincides with treatment, these genes can be removed before enrichment so that pathway results reflect state-specific differences. Here the shared genes form a coherent biological program (Treg admixture and reduced quiescence), so they are **kept**. The switch `remove_shared_signature` below controls this step, and the before/after table shows what removal would change.
+
+```{r}
+#| label: read-pseudobulk-de
+#| message: false
+#| warning: false
+
+pb_de_file <- file.path(output_dir, "pseudobulk_DE_edgeR_all_refined_states_TNFR2a_vs_Control.csv")
+
+if (!file.exists(pb_de_file)) {
+  stop(
+    "Missing pseudobulk DE file: ", pb_de_file,
+    ". Run Differential_expression.qmd before Pathway_analysis.qmd."
+  )
+}
+
+pb_de <- readr::read_csv(pb_de_file, show_col_types = FALSE)
+
+if (!"FDR_global" %in% colnames(pb_de)) pb_de$FDR_global <- NA_real_
+if (!"FDR_cluster" %in% colnames(pb_de)) pb_de$FDR_cluster <- pb_de$FDR
+
+pb_de <- pb_de %>%
+  dplyr::mutate(
+    gene = as.character(gene),
+    cluster = as.character(cluster),
+    cluster = factor(cluster, levels = state_levels),
+    cluster_label = get_state_label(cluster),
+    logFC = as.numeric(logFC),
+    PValue = as.numeric(PValue),
+    FDR = as.numeric(FDR),
+    FDR_global = as.numeric(FDR_global),
+    FDR_cluster = as.numeric(FDR_cluster),
+    Direction = dplyr::case_when(
+      is.finite(logFC) & logFC > 0 ~ "Up in TNFR2a",
+      is.finite(logFC) & logFC < 0 ~ "Up in Control",
+      TRUE ~ "No direction"
+    )
+  ) %>%
+  dplyr::filter(!is.na(cluster), !is.na(gene), gene != "") %>%
+  dplyr::arrange(cluster, PValue)
+
+stopifnot(all(c("gene", "cluster", "logFC", "PValue", "FDR_cluster") %in% colnames(pb_de)))
+
+pb_de <- pb_de %>%
+  dplyr::mutate(
+    rank_score = dplyr::case_when(
+      is.finite(PValue) & PValue > 0 & is.finite(logFC) ~ sign(logFC) * -log10(PValue),
+      is.finite(logFC) ~ logFC,
+      TRUE ~ NA_real_
+    ),
+    rank_score = rank_score + (logFC * 1e-6)
+  )
+```
+
+```{r}
+#| label: tbl-remove-shared-signature
+#| message: false
+#| warning: false
+#| tbl-cap: "Significant pseudobulk DE genes per state with and without the shared signature (genes significant in a consistent direction in at least 6 states). The full gene set is used for enrichment in this book."
+
+# Switch: remove genes shared across many states before enrichment?
+# TRUE when the shared shift looks technical; FALSE when it is biology.
+remove_shared_signature <- FALSE
+
+pb_de_full <- pb_de
+
+min_states_shared <- 6
+
+shared_gene_summary <- pb_de_full %>%
+  dplyr::filter(.data[[primary_fdr_col]] < primary_fdr_cutoff, is.finite(logFC)) %>%
+  dplyr::group_by(gene) %>%
+  dplyr::summarise(
+    n_states_sig = dplyr::n_distinct(cluster),
+    n_up_in_TNFR2a = sum(logFC > 0),
+    n_up_in_Control = sum(logFC < 0),
+    .groups = "drop"
+  ) %>%
+  dplyr::mutate(
+    consistent_direction = pmax(n_up_in_TNFR2a, n_up_in_Control) /
+      (n_up_in_TNFR2a + n_up_in_Control) >= 0.8
+  )
+
+shared_signature_genes <- shared_gene_summary %>%
+  dplyr::filter(n_states_sig >= min_states_shared, consistent_direction) %>%
+  dplyr::pull(gene)
+
+shared_signature_genes <- union(
+  shared_signature_genes,
+  grep("^mt-", unique(pb_de_full$gene), value = TRUE)
+)
+
+readr::write_csv(
+  shared_gene_summary %>% dplyr::filter(gene %in% shared_signature_genes) %>%
+    dplyr::arrange(dplyr::desc(n_states_sig)),
+  file.path(output_dir, "pathway_removed_shared_signature_genes.csv")
+)
+
+pb_de_filtered <- pb_de_full %>%
+  dplyr::filter(!gene %in% shared_signature_genes)
+
+pb_de <- if (remove_shared_signature) pb_de_filtered else pb_de_full
+
+before_after <- dplyr::full_join(
+  pb_de_full %>%
+    dplyr::group_by(cluster_label) %>%
+    dplyr::summarise(sig_before = sum(.data[[primary_fdr_col]] < primary_fdr_cutoff, na.rm = TRUE), .groups = "drop"),
+  pb_de_filtered %>%
+    dplyr::group_by(cluster_label) %>%
+    dplyr::summarise(sig_after = sum(.data[[primary_fdr_col]] < primary_fdr_cutoff, na.rm = TRUE), .groups = "drop"),
+  by = "cluster_label"
+)
+
+cat("Shared-signature genes:", length(shared_signature_genes),
+    "| removed before enrichment:", remove_shared_signature, "\n")
+knitr::kable(before_after, align = "c")
+```
+
+```{r}
+#| label: pseudobulk-de-summary-for-pathways
+#| message: false
+#| warning: false
+#| tbl-cap: "Pseudobulk DE genes available for pathway analysis per refined state. Significant genes are defined using state-level FDR < 0.05."
+
+pb_pathway_summary <- pb_de %>%
+  dplyr::group_by(cluster, cluster_label) %>%
+  dplyr::summarise(
+    genes_tested = dplyr::n_distinct(gene),
+    sig_genes = sum(.data[[primary_fdr_col]] < primary_fdr_cutoff, na.rm = TRUE),
+    sig_up_in_TNFR2a = sum(.data[[primary_fdr_col]] < primary_fdr_cutoff & logFC > 0, na.rm = TRUE),
+    sig_up_in_Control = sum(.data[[primary_fdr_col]] < primary_fdr_cutoff & logFC < 0, na.rm = TRUE),
+    min_FDR_cluster = min(FDR_cluster, na.rm = TRUE),
+    min_FDR_global = min(FDR_global, na.rm = TRUE),
+    .groups = "drop"
+  ) %>%
+  dplyr::arrange(cluster) %>%
+  dplyr::mutate(
+    cluster = as.character(cluster),
+    min_FDR_cluster = formatC(min_FDR_cluster, format = "e", digits = 2),
+    min_FDR_global = ifelse(
+      is.finite(min_FDR_global),
+      formatC(min_FDR_global, format = "e", digits = 2),
+      NA_character_
+    )
+  )
+
+readr::write_csv(
+  pb_pathway_summary,
+  file.path(output_dir, "pathway_pseudobulk_DE_input_summary_TNFR2a_vs_Control.csv")
+)
+
+knitr::kable(pb_pathway_summary, align = "c")
+```
+
+```{r}
+#| label: prepare-entrez-mapped-pseudobulk-de
+#| message: false
+#| warning: false
+
+pb_de_entrez <- pb_de %>%
+  dplyr::mutate(
+    ENTREZID = sym2ent_mm_vec(gene),
+    ENTREZID = as.character(ENTREZID)
+  ) %>%
+  dplyr::filter(!is.na(ENTREZID), ENTREZID != "")
+
+pb_deg_entrez <- pb_de_entrez %>%
+  dplyr::filter(.data[[primary_fdr_col]] < primary_fdr_cutoff) %>%
+  dplyr::distinct(cluster, cluster_label, gene, ENTREZID, Direction, logFC, .keep_all = TRUE)
+
+entrez_mapping_summary <- tibble::tibble(
+  metric = c(
+    "Genes tested in pseudobulk DE",
+    "Genes mapped to Entrez IDs",
+    "Significant pseudobulk DE genes",
+    "Significant pseudobulk DE genes mapped to Entrez IDs"
+  ),
+  value = c(
+    dplyr::n_distinct(pb_de$gene),
+    dplyr::n_distinct(pb_de_entrez$gene),
+    dplyr::n_distinct(pb_de$gene[pb_de[[primary_fdr_col]] < primary_fdr_cutoff]),
+    dplyr::n_distinct(pb_deg_entrez$gene)
+  )
+)
+
+knitr::kable(
+  entrez_mapping_summary,
+  caption = "Gene identifier mapping summary for pathway analysis."
+)
+```
+
+## Over-representation analysis design
+
+ORA was performed separately within each refined state using significant pseudobulk DE genes. For each state, enrichment was tested against a state-specific universe consisting of genes tested in the corresponding pseudobulk model and successfully mapped to Entrez IDs. Direction-aware ORA was performed for genes upregulated in TNFR2a and genes upregulated in Control, with an additional combined DE gene set provided as a descriptive summary.
+
+```{r}
+#| label: generic-ora-functions
+#| message: false
+#| warning: false
+
+run_ora_for_state <- function(df_state, state_id, database = c("KEGG", "Reactome", "GO_BP"),
+                              term2gene = NULL, term2name = NULL) {
+  database <- match.arg(database)
+
+  state_label <- get_state_label(state_id)
+
+  universe <- df_state %>%
+    dplyr::filter(!is.na(ENTREZID), ENTREZID != "") %>%
+    dplyr::distinct(ENTREZID) %>%
+    dplyr::pull(ENTREZID)
+
+  deg_df <- df_state %>%
+    dplyr::filter(.data[[primary_fdr_col]] < primary_fdr_cutoff) %>%
+    dplyr::filter(!is.na(ENTREZID), ENTREZID != "") %>%
+    dplyr::distinct(gene, ENTREZID, Direction, logFC)
+
+  gene_lists <- list(
+    "DE (any)" = unique(deg_df$ENTREZID),
+    "Up in TNFR2a" = unique(deg_df$ENTREZID[deg_df$Direction == "Up in TNFR2a"]),
+    "Up in Control" = unique(deg_df$ENTREZID[deg_df$Direction == "Up in Control"])
+  )
+
+  purrr::map_dfr(names(gene_lists), function(direction) {
+    genes <- gene_lists[[direction]]
+    if (length(genes) < min_genes_ora || length(universe) < min_gs_size) return(empty_tbl())
+
+    enr <- tryCatch({
+      if (database == "KEGG") {
+        clusterProfiler::enricher(
+          gene = genes,
+          universe = universe,
+          TERM2GENE = term2gene,
+          TERM2NAME = term2name,
+          pAdjustMethod = "BH",
+          pvalueCutoff = 1,
+          qvalueCutoff = 1
+        )
+      } else if (database == "Reactome") {
+        ReactomePA::enrichPathway(
+          gene = genes,
+          universe = universe,
+          organism = "mouse",
+          pAdjustMethod = "BH",
+          pvalueCutoff = 1,
+          qvalueCutoff = 1,
+          readable = TRUE
+        )
+      } else {
+        clusterProfiler::enrichGO(
+          gene = genes,
+          universe = universe,
+          OrgDb = org.Mm.eg.db,
+          keyType = "ENTREZID",
+          ont = "BP",
+          pAdjustMethod = "BH",
+          pvalueCutoff = 1,
+          qvalueCutoff = 1,
+          readable = TRUE
+        )
+      }
+    }, error = function(e) {
+      message("Skipping ", database, " ORA for ", state_id, " / ", direction, ": ", conditionMessage(e))
+      NULL
+    })
+
+    if (is.null(enr) || nrow(as.data.frame(enr)) == 0) return(empty_tbl())
+
+    as.data.frame(enr) %>%
+      tibble::as_tibble() %>%
+      dplyr::mutate(
+        database = database,
+        cluster = as.character(state_id),
+        cluster_label = state_label,
+        Direction = direction,
+        Description = clean_pathway_name(Description)
+      )
+  })
+}
+```
+
+## KEGG pathway ORA
+
+```{r}
+#| label: load-kegg-cache
+#| message: false
+#| warning: false
+
+kegg_link_file <- "resources/kegg/mmu_link_pathway.tsv"
+kegg_name_file <- "resources/kegg/mmu_pathway_list.tsv"
+
+if (!file.exists(kegg_link_file) || !file.exists(kegg_name_file)) {
+  stop(
+    "Missing KEGG cache files in resources/kegg/. Expected files: ",
+    kegg_link_file, " and ", kegg_name_file
+  )
+}
+
+kegg_link <- read.delim(kegg_link_file, header = FALSE, stringsAsFactors = FALSE)
+colnames(kegg_link) <- c("gene", "pathway")
+kegg_link$gene <- sub("^mmu:", "", kegg_link$gene)
+kegg_link$pathway <- sub("^path:", "", kegg_link$pathway)
+
+kegg_name <- read.delim(kegg_name_file, header = FALSE, stringsAsFactors = FALSE)
+colnames(kegg_name) <- c("pathway", "Description")
+kegg_name$pathway <- sub("^path:", "", kegg_name$pathway)
+kegg_name$Description <- clean_pathway_name(kegg_name$Description)
+
+KEGG_TERM2GENE <- kegg_link[, c("pathway", "gene")]
+KEGG_TERM2NAME <- kegg_name
+```
+
+```{r}
+#| label: kegg-ora-pseudobulk
+#| message: false
+#| warning: false
+
+kegg_ora_pb <- pb_de_entrez %>%
+  dplyr::group_by(cluster) %>%
+  dplyr::group_split() %>%
+  purrr::map_dfr(function(df_state) {
+    state_id <- as.character(unique(df_state$cluster))
+    run_ora_for_state(
+      df_state = df_state,
+      state_id = state_id,
+      database = "KEGG",
+      term2gene = KEGG_TERM2GENE,
+      term2name = KEGG_TERM2NAME
+    )
+  }) %>%
+  dplyr::arrange(cluster, Direction, p.adjust)
+
+readr::write_csv(
+  kegg_ora_pb,
+  file.path(output_dir, "pathway_KEGG_ORA_pseudobulk_refined_states_TNFR2a_vs_Control.csv")
+)
+```
+
+```{r}
+#| label: tbl-kegg-ora-pseudobulk
+#| message: false
+#| warning: false
+#| tbl-cap: "KEGG ORA based on significant pseudobulk DE genes per refined state and direction."
+
+kegg_ora_pb %>%
+  dplyr::filter(!is.na(p.adjust)) %>%
+  dplyr::arrange(cluster, Direction, p.adjust) %>%
+  dplyr::select(database, cluster, cluster_label, Direction, ID, Description, Count, GeneRatio, pvalue, p.adjust) %>%
+  dplyr::group_by(cluster, Direction) %>%
+  dplyr::slice_head(n = 10) %>%
+  dplyr::ungroup() %>%
+  knitr::kable(align = "c")
+```
+
+```{r}
+#| label: fig-kegg-ora-TNFR2a
+#| message: false
+#| warning: false
+#| fig-width: 10
+#| fig-height: 8
+#| fig-dpi: 300
+#| fig-cap: "KEGG ORA terms enriched among genes upregulated in TNFR2a."
+
+plot_df <- kegg_ora_pb %>%
+  dplyr::filter(Direction == "Up in TNFR2a") %>%
+  dplyr::filter(!is.na(p.adjust), p.adjust < plot_fdr_cutoff) %>%
+  dplyr::mutate(
+    minus_log10_fdr = -log10(p.adjust),
+    Description = stringr::str_wrap(Description, width = 40),
+    pathway_group = dplyr::case_when(
+      stringr::str_detect(Description, "interferon|IFN") ~ "Interferon",
+      stringr::str_detect(Description, "TNF|NF") ~ "Inflammation",
+      stringr::str_detect(Description, "cell cycle|mitotic|DNA replication") ~ "Cell cycle / replication",
+      stringr::str_detect(Description, "oxidative phosphorylation|respiratory|electron transport|thermogenesis") ~ "Mitochondrial metabolism",
+      stringr::str_detect(Description, "glycolysis|carbon metabolism|amino acid|biosynthesis") ~ "Metabolism",
+      TRUE ~ "Other"
+    )
+  ) %>%
+  dplyr::group_by(cluster_label) %>%
+  dplyr::slice_max(order_by = minus_log10_fdr, n = 8, with_ties = FALSE) %>%
+  dplyr::ungroup()
+
+if (nrow(plot_df) == 0) {
+  plot_empty("No significant KEGG ORA terms (TNFR2a)")
+} else {
+  ggplot2::ggplot(
+    plot_df,
+    ggplot2::aes(
+      x = minus_log10_fdr,
+      y = stats::reorder(Description, minus_log10_fdr),
+      size = Count,
+      colour = pathway_group
+    )
+  ) +
+    ggplot2::geom_point(alpha = 0.85) +
+    ggplot2::scale_colour_manual(
+      values = c(
+        "Interferon" = "#CC79A7",
+        "Inflammation" = "#D55E00",
+        "Cell cycle / replication" = "#009E73",
+        "Mitochondrial metabolism" = "#0072B2",
+        "Metabolism" = "#E69F00",
+        "Other" = "grey70"
+      )
+    ) +
+    ggplot2::facet_wrap(~ cluster_label, scales = "free_y") +
+    ggplot2::labs(
+      x = expression(-log[10]("FDR")),
+      y = NULL,
+      size = "DE genes",
+      colour = "Pathway theme"
+    ) +
+    ggplot2::theme_bw(base_size = 11) +
+    ggplot2::theme(
+      strip.text = ggplot2::element_text(size = 9),
+      axis.text.y = ggplot2::element_text(size = 7)
+    )
+}
+```
+
+```{r}
+#| label: fig-kegg-ora-Control
+#| message: false
+#| warning: false
+#| fig-width: 10
+#| fig-height: 8
+#| fig-dpi: 300
+#| fig-cap: "KEGG ORA terms enriched among genes upregulated in Control."
+
+plot_df <- kegg_ora_pb %>%
+  dplyr::filter(Direction == "Up in Control") %>%
+  dplyr::filter(!is.na(p.adjust), p.adjust < plot_fdr_cutoff) %>%
+  dplyr::mutate(
+    minus_log10_fdr = -log10(p.adjust),
+    Description = stringr::str_wrap(Description, width = 40),
+    pathway_group = dplyr::case_when(
+      stringr::str_detect(Description, "interferon|IFN") ~ "Interferon",
+      stringr::str_detect(Description, "TNF|NF") ~ "Inflammation",
+      stringr::str_detect(Description, "cell cycle|mitotic|DNA replication") ~ "Cell cycle / replication",
+      stringr::str_detect(Description, "oxidative phosphorylation|respiratory|electron transport|thermogenesis") ~ "Mitochondrial metabolism",
+      stringr::str_detect(Description, "glycolysis|carbon metabolism|amino acid|biosynthesis") ~ "Metabolism",
+      TRUE ~ "Other"
+    )
+  ) %>%
+  dplyr::group_by(cluster_label) %>%
+  dplyr::slice_max(order_by = minus_log10_fdr, n = 8, with_ties = FALSE) %>%
+  dplyr::ungroup()
+
+if (nrow(plot_df) == 0) {
+  plot_empty("No significant KEGG ORA terms (Control)")
+} else {
+  ggplot2::ggplot(
+    plot_df,
+    ggplot2::aes(
+      x = minus_log10_fdr,
+      y = stats::reorder(Description, minus_log10_fdr),
+      size = Count,
+      colour = pathway_group
+    )
+  ) +
+    ggplot2::geom_point(alpha = 0.85) +
+    ggplot2::scale_colour_manual(
+      values = c(
+        "Interferon" = "#CC79A7",
+        "Inflammation" = "#D55E00",
+        "Cell cycle / replication" = "#009E73",
+        "Mitochondrial metabolism" = "#0072B2",
+        "Metabolism" = "#E69F00",
+        "Other" = "grey70"
+      )
+    ) +
+    ggplot2::facet_wrap(~ cluster_label, scales = "free_y") +
+    ggplot2::labs(
+      x = expression(-log[10]("FDR")),
+      y = NULL,
+      size = "DE genes",
+      colour = "Pathway theme"
+    ) +
+    ggplot2::theme_bw(base_size = 11) +
+    ggplot2::theme(
+      strip.text = ggplot2::element_text(size = 9),
+      axis.text.y = ggplot2::element_text(size = 7)
+    )
+}
+```
+
+## Reactome ORA
+
+```{r}
+#| label: reactome-ora-pseudobulk
+#| message: false
+#| warning: false
+
+reactome_ora_pb <- pb_de_entrez %>%
+  dplyr::group_by(cluster) %>%
+  dplyr::group_split() %>%
+  purrr::map_dfr(function(df_state) {
+    state_id <- as.character(unique(df_state$cluster))
+    run_ora_for_state(df_state = df_state, state_id = state_id, database = "Reactome")
+  }) %>%
+  dplyr::arrange(cluster, Direction, p.adjust)
+
+readr::write_csv(
+  reactome_ora_pb,
+  file.path(output_dir, "pathway_Reactome_ORA_pseudobulk_refined_states_TNFR2a_vs_Control.csv")
+)
+```
+
+```{r}
+#| label: fig-reactome-ora-TNFR2a
+#| message: false
+#| warning: false
+#| fig-width: 10
+#| fig-height: 8
+#| fig-dpi: 300
+#| fig-cap: "Reactome ORA terms enriched among genes upregulated in TNFR2a."
+
+plot_df <- reactome_ora_pb %>%
+  dplyr::filter(Direction == "Up in TNFR2a") %>%
+  dplyr::filter(!is.na(p.adjust), p.adjust < plot_fdr_cutoff) %>%
+  dplyr::mutate(
+    minus_log10_fdr = -log10(p.adjust),
+    Description = stringr::str_wrap(Description, width = 40),
+    pathway_group = dplyr::case_when(
+      stringr::str_detect(Description, "interferon|IFN") ~ "Interferon",
+      stringr::str_detect(Description, "TNF|NF") ~ "Inflammation",
+      stringr::str_detect(Description, "cell cycle|mitotic") ~ "Cell cycle",
+      TRUE ~ "Other"
+    )
+  ) %>%
+  dplyr::group_by(cluster_label) %>%
+  dplyr::slice_max(order_by = minus_log10_fdr, n = 8, with_ties = FALSE) %>%
+  dplyr::ungroup()
+
+if (nrow(plot_df) == 0) {
+  plot_empty("No significant Reactome ORA terms (TNFR2a)")
+} else {
+  ggplot2::ggplot(
+    plot_df,
+    ggplot2::aes(
+      x = minus_log10_fdr,
+      y = stats::reorder(Description, minus_log10_fdr),
+      size = Count,
+      colour = pathway_group
+    )
+  ) +
+    ggplot2::geom_point(alpha = 0.85) +
+    ggplot2::scale_colour_manual(
+      values = c(
+        "Interferon" = "#CC79A7",
+        "Inflammation" = "#D55E00",
+        "Cell cycle" = "#009E73",
+        "Other" = "grey70"
+      )
+    ) +
+    ggplot2::facet_wrap(~ cluster_label, scales = "free_y") +
+    ggplot2::labs(
+      x = expression(-log[10]("FDR")),
+      y = NULL,
+      size = "DE genes",
+      colour = "Pathway theme"
+    ) +
+    ggplot2::theme_bw(base_size = 11) +
+    ggplot2::theme(
+      strip.text = ggplot2::element_text(size = 9),
+      axis.text.y = ggplot2::element_text(size = 7)
+    )
+}
+```
+
+```{r}
+#| label: fig-reactome-ora-Control
+#| message: false
+#| warning: false
+#| fig-width: 10
+#| fig-height: 8
+#| fig-dpi: 300
+#| fig-cap: "Reactome ORA terms enriched among genes upregulated in Control."
+
+plot_df <- reactome_ora_pb %>%
+  dplyr::filter(Direction == "Up in Control") %>%
+  dplyr::filter(!is.na(p.adjust), p.adjust < plot_fdr_cutoff) %>%
+  dplyr::mutate(
+    minus_log10_fdr = -log10(p.adjust),
+    Description = stringr::str_wrap(Description, width = 40),
+    pathway_group = dplyr::case_when(
+      stringr::str_detect(Description, "interferon|IFN") ~ "Interferon",
+      stringr::str_detect(Description, "TNF|NF") ~ "Inflammation",
+      stringr::str_detect(Description, "cell cycle|mitotic") ~ "Cell cycle",
+      TRUE ~ "Other"
+    )
+  ) %>%
+  dplyr::group_by(cluster_label) %>%
+  dplyr::slice_max(order_by = minus_log10_fdr, n = 8, with_ties = FALSE) %>%
+  dplyr::ungroup()
+
+if (nrow(plot_df) == 0) {
+  plot_empty("No significant Reactome ORA terms (Control)")
+} else {
+  ggplot2::ggplot(
+    plot_df,
+    ggplot2::aes(
+      x = minus_log10_fdr,
+      y = stats::reorder(Description, minus_log10_fdr),
+      size = Count,
+      colour = pathway_group
+    )
+  ) +
+    ggplot2::geom_point(alpha = 0.85) +
+    ggplot2::scale_colour_manual(
+      values = c(
+        "Interferon" = "#CC79A7",
+        "Inflammation" = "#D55E00",
+        "Cell cycle" = "#009E73",
+        "Other" = "grey70"
+      )
+    ) +
+    ggplot2::facet_wrap(~ cluster_label, scales = "free_y") +
+    ggplot2::labs(
+      x = expression(-log[10]("FDR")),
+      y = NULL,
+      size = "DE genes",
+      colour = "Pathway theme"
+    ) +
+    ggplot2::theme_bw(base_size = 11) +
+    ggplot2::theme(
+      strip.text = ggplot2::element_text(size = 9),
+      axis.text.y = ggplot2::element_text(size = 7)
+    )
+}
+```
+
+## Gene Ontology Biological Process ORA
+
+```{r}
+#| label: go-bp-ora-pseudobulk
+#| message: false
+#| warning: false
+
+go_bp_ora_pb <- pb_de_entrez %>%
+  dplyr::group_by(cluster) %>%
+  dplyr::group_split() %>%
+  purrr::map_dfr(function(df_state) {
+    state_id <- as.character(unique(df_state$cluster))
+    run_ora_for_state(df_state = df_state, state_id = state_id, database = "GO_BP")
+  }) %>%
+  dplyr::arrange(cluster, Direction, p.adjust)
+
+readr::write_csv(
+  go_bp_ora_pb,
+  file.path(output_dir, "pathway_GO_BP_ORA_pseudobulk_refined_states_TNFR2a_vs_Control.csv")
+)
+```
+
+```{r}
+#| label: fig-go-bp-ora-TNFR2a
+#| message: false
+#| warning: false
+#| fig-width: 10
+#| fig-height: 8
+#| fig-dpi: 300
+#| fig-cap: "GO Biological Process ORA terms enriched among genes upregulated in TNFR2a."
+
+plot_df <- go_bp_ora_pb %>%
+  dplyr::filter(Direction == "Up in TNFR2a") %>%
+  dplyr::filter(!is.na(p.adjust), p.adjust < plot_fdr_cutoff) %>%
+  dplyr::mutate(
+    minus_log10_fdr = -log10(p.adjust),
+    Description = stringr::str_wrap(Description, width = 40),
+    pathway_group = dplyr::case_when(
+      stringr::str_detect(Description, "interferon|IFN") ~ "Interferon",
+      stringr::str_detect(Description, "TNF|NF") ~ "Inflammation",
+      stringr::str_detect(Description, "cell cycle|mitotic|DNA replication|chromatid|chromosome segregation") ~ "Cell cycle / replication",
+      stringr::str_detect(Description, "oxidative phosphorylation|respiratory|electron transport|ATP synthesis|proton transmembrane") ~ "Mitochondrial metabolism",
+      stringr::str_detect(Description, "glycolysis|carbon|amino acid|biosynthetic|metabolic process") ~ "Metabolism",
+      stringr::str_detect(Description, "cytokine|immune|inflammatory") ~ "Immune signalling",
+      TRUE ~ "Other"
+    )
+  ) %>%
+  dplyr::group_by(cluster_label) %>%
+  dplyr::slice_max(order_by = minus_log10_fdr, n = 8, with_ties = FALSE) %>%
+  dplyr::ungroup()
+
+if (nrow(plot_df) == 0) {
+  plot_empty("No significant GO BP ORA terms (TNFR2a)")
+} else {
+  ggplot2::ggplot(
+    plot_df,
+    ggplot2::aes(
+      x = minus_log10_fdr,
+      y = stats::reorder(Description, minus_log10_fdr),
+      size = Count,
+      colour = pathway_group
+    )
+  ) +
+    ggplot2::geom_point(alpha = 0.85) +
+    ggplot2::scale_colour_manual(
+      values = c(
+        "Interferon" = "#CC79A7",
+        "Inflammation" = "#D55E00",
+        "Immune signalling" = "#56B4E9",
+        "Cell cycle / replication" = "#009E73",
+        "Mitochondrial metabolism" = "#0072B2",
+        "Metabolism" = "#E69F00",
+        "Other" = "grey70"
+      )
+    ) +
+    ggplot2::facet_wrap(~ cluster_label, scales = "free_y") +
+    ggplot2::labs(
+      x = expression(-log[10]("FDR")),
+      y = NULL,
+      size = "DE genes",
+      colour = "Pathway theme"
+    ) +
+    ggplot2::theme_bw(base_size = 11) +
+    ggplot2::theme(
+      strip.text = ggplot2::element_text(size = 9),
+      axis.text.y = ggplot2::element_text(size = 7)
+    )
+}
+```
+
+```{r}
+#| label: fig-go-bp-ora-Control
+#| message: false
+#| warning: false
+#| fig-width: 10
+#| fig-height: 8
+#| fig-dpi: 300
+#| fig-cap: "GO Biological Process ORA terms enriched among genes upregulated in Control."
+
+plot_df <- go_bp_ora_pb %>%
+  dplyr::filter(Direction == "Up in Control") %>%
+  dplyr::filter(!is.na(p.adjust), p.adjust < plot_fdr_cutoff) %>%
+  dplyr::mutate(
+    minus_log10_fdr = -log10(p.adjust),
+    Description = stringr::str_wrap(Description, width = 40),
+    pathway_group = dplyr::case_when(
+      stringr::str_detect(Description, "interferon|IFN") ~ "Interferon",
+      stringr::str_detect(Description, "TNF|NF") ~ "Inflammation",
+      stringr::str_detect(Description, "cell cycle|mitotic|DNA replication|chromatid|chromosome segregation") ~ "Cell cycle / replication",
+      stringr::str_detect(Description, "oxidative phosphorylation|respiratory|electron transport|ATP synthesis|proton transmembrane") ~ "Mitochondrial metabolism",
+      stringr::str_detect(Description, "glycolysis|carbon|amino acid|biosynthetic|metabolic process") ~ "Metabolism",
+      stringr::str_detect(Description, "cytokine|immune|inflammatory") ~ "Immune signalling",
+      TRUE ~ "Other"
+    )
+  ) %>%
+  dplyr::group_by(cluster_label) %>%
+  dplyr::slice_max(order_by = minus_log10_fdr, n = 8, with_ties = FALSE) %>%
+  dplyr::ungroup()
+
+if (nrow(plot_df) == 0) {
+  plot_empty("No significant GO BP ORA terms (Control)")
+} else {
+  ggplot2::ggplot(
+    plot_df,
+    ggplot2::aes(
+      x = minus_log10_fdr,
+      y = stats::reorder(Description, minus_log10_fdr),
+      size = Count,
+      colour = pathway_group
+    )
+  ) +
+    ggplot2::geom_point(alpha = 0.85) +
+    ggplot2::scale_colour_manual(
+      values = c(
+        "Interferon" = "#CC79A7",
+        "Inflammation" = "#D55E00",
+        "Immune signalling" = "#56B4E9",
+        "Cell cycle / replication" = "#009E73",
+        "Mitochondrial metabolism" = "#0072B2",
+        "Metabolism" = "#E69F00",
+        "Other" = "grey70"
+      )
+    ) +
+    ggplot2::facet_wrap(~ cluster_label, scales = "free_y") +
+    ggplot2::labs(
+      x = expression(-log[10]("FDR")),
+      y = NULL,
+      size = "DE genes",
+      colour = "Pathway theme"
+    ) +
+    ggplot2::theme_bw(base_size = 11) +
+    ggplot2::theme(
+      strip.text = ggplot2::element_text(size = 9),
+      axis.text.y = ggplot2::element_text(size = 7)
+    )
+}
+```
+
+## Gene set enrichment analysis design
+
+GSEA was performed on all genes tested in each pseudobulk state-level model. Genes were ranked by a signed significance statistic, defined as sign(logFC) × −log10(P value), with positive values indicating genes higher in TNFR2a and negative values indicating genes higher in Control. This ranking retains both direction and evidence strength while avoiding an arbitrary DEG threshold.
+
+```{r}
+#| label: generic-gsea-functions
+#| message: false
+#| warning: false
+
+make_gene_list_for_gsea <- function(df_state, score_col = "rank_score") {
+  rank_df <- df_state %>%
+    dplyr::filter(!is.na(ENTREZID), ENTREZID != "") %>%
+    dplyr::mutate(score = as.numeric(.data[[score_col]])) %>%
+    dplyr::filter(is.finite(score)) %>%
+    dplyr::group_by(ENTREZID) %>%
+    dplyr::slice_max(order_by = abs(score), n = 1, with_ties = FALSE) %>%
+    dplyr::ungroup()
+
+  gene_list <- rank_df$score
+  names(gene_list) <- rank_df$ENTREZID
+  gene_list <- gene_list[is.finite(gene_list)]
+  gene_list <- gene_list[!duplicated(names(gene_list))]
+  sort(gene_list, decreasing = TRUE)
+}
+
+run_gsea_for_state <- function(df_state, state_id, database = c("KEGG", "Reactome", "GO_BP"),
+                               term2gene = NULL, term2name = NULL) {
+  database <- match.arg(database)
+  state_label <- get_state_label(state_id)
+  gene_list <- make_gene_list_for_gsea(df_state, score_col = "rank_score")
+
+  if (length(gene_list) < min_gs_size || length(unique(gene_list)) < 2) return(empty_tbl())
+
+  gsea_res <- tryCatch({
+    if (database == "KEGG") {
+      clusterProfiler::GSEA(
+        geneList = gene_list,
+        TERM2GENE = term2gene,
+        TERM2NAME = term2name,
+        minGSSize = min_gs_size,
+        maxGSSize = max_gs_size,
+        pAdjustMethod = "BH",
+        pvalueCutoff = 1,
+        verbose = FALSE
+      )
+    } else if (database == "Reactome") {
+      ReactomePA::gsePathway(
+        geneList = gene_list,
+        organism = "mouse",
+        minGSSize = min_gs_size,
+        maxGSSize = max_gs_size,
+        pAdjustMethod = "BH",
+        pvalueCutoff = 1,
+        verbose = FALSE
+      )
+    } else {
+      clusterProfiler::gseGO(
+        geneList = gene_list,
+        OrgDb = org.Mm.eg.db,
+        keyType = "ENTREZID",
+        ont = "BP",
+        minGSSize = min_gs_size,
+        maxGSSize = max_gs_size,
+        pAdjustMethod = "BH",
+        pvalueCutoff = 1,
+        verbose = FALSE
+      )
+    }
+  }, error = function(e) {
+    message("Skipping ", database, " GSEA for ", state_id, ": ", conditionMessage(e))
+    NULL
+  })
+
+  if (is.null(gsea_res) || nrow(as.data.frame(gsea_res)) == 0) return(empty_tbl())
+
+  as.data.frame(gsea_res) %>%
+    tibble::as_tibble() %>%
+    dplyr::mutate(
+      database = database,
+      cluster = as.character(state_id),
+      cluster_label = state_label,
+      Direction = dplyr::case_when(
+        NES > 0 ~ "Enriched in TNFR2a-ranked genes",
+        NES < 0 ~ "Enriched in Control-ranked genes",
+        TRUE ~ "No direction"
+      ),
+      Description = clean_pathway_name(Description)
+    )
+}
+```
+
+## KEGG GSEA
+
+```{r}
+#| label: kegg-gsea-pseudobulk
+#| message: false
+#| warning: false
+
+kegg_gsea_pb <- pb_de_entrez %>%
+  dplyr::group_by(cluster) %>%
+  dplyr::group_split() %>%
+  purrr::map_dfr(function(df_state) {
+    state_id <- as.character(unique(df_state$cluster))
+    run_gsea_for_state(
+      df_state = df_state,
+      state_id = state_id,
+      database = "KEGG",
+      term2gene = KEGG_TERM2GENE,
+      term2name = KEGG_TERM2NAME
+    )
+  }) %>%
+  dplyr::arrange(cluster, p.adjust)
+
+readr::write_csv(
+  kegg_gsea_pb,
+  file.path(output_dir, "pathway_KEGG_GSEA_pseudobulk_refined_states_TNFR2a_vs_Control.csv")
+)
+```
+
+```{r}
+#| label: fig-kegg-gsea-directional
+#| message: false
+#| warning: false
+#| fig-width: 12
+#| fig-height: 8
+#| fig-dpi: 300
+#| fig-cap: "KEGG GSEA terms. Positive NES indicates enrichment in TNFR2a; negative NES indicates enrichment in Control."
+
+plot_df <- kegg_gsea_pb %>%
+  dplyr::filter(!is.na(p.adjust), p.adjust < plot_fdr_cutoff) %>%
+  dplyr::mutate(
+    Description = stringr::str_wrap(Description, width = 40),
+    pathway_group = dplyr::case_when(
+      stringr::str_detect(Description, "interferon|IFN") ~ "Interferon",
+      stringr::str_detect(Description, "TNF|NF") ~ "Inflammation",
+      stringr::str_detect(Description, "cell cycle|mitotic|DNA replication") ~ "Cell cycle / replication",
+      stringr::str_detect(Description, "oxidative phosphorylation|respiratory|electron transport|thermogenesis") ~ "Mitochondrial metabolism",
+      stringr::str_detect(Description, "glycolysis|carbon metabolism|amino acid|biosynthesis") ~ "Metabolism",
+      TRUE ~ "Other"
+    )
+  ) %>%
+  dplyr::group_by(cluster_label) %>%
+  dplyr::slice_max(order_by = abs(NES), n = 6, with_ties = FALSE) %>%
+  dplyr::ungroup()
+
+if (nrow(plot_df) == 0) {
+  plot_empty("No significant KEGG GSEA terms")
+} else {
+  ggplot2::ggplot(
+    plot_df,
+    ggplot2::aes(
+      x = NES,
+      y = stats::reorder(Description, NES),
+      size = setSize,
+      colour = pathway_group
+    )
+  ) +
+    ggplot2::geom_vline(xintercept = 0, linetype = "dashed") +
+    ggplot2::geom_point(alpha = 0.9) +
+    ggplot2::scale_colour_manual(
+      values = c(
+        "Interferon" = "#CC79A7",
+        "Inflammation" = "#D55E00",
+        "Cell cycle / replication" = "#009E73",
+        "Mitochondrial metabolism" = "#0072B2",
+        "Metabolism" = "#E69F00",
+        "Other" = "grey70"
+      )
+    ) +
+    ggplot2::facet_wrap(~ cluster_label, scales = "free_y") +
+    ggplot2::labs(
+      x = "Normalized enrichment score (NES)",
+      y = NULL,
+      size = "Gene set size",
+      colour = "Pathway theme"
+    ) +
+    ggplot2::theme_bw(base_size = 11) +
+    ggplot2::theme(
+      strip.text = ggplot2::element_text(size = 9),
+      axis.text.y = ggplot2::element_text(size = 7)
+    )
+}
+```
+
+## Reactome GSEA
+
+```{r}
+#| label: reactome-gsea-pseudobulk
+#| message: false
+#| warning: false
+
+reactome_gsea_pb <- pb_de_entrez %>%
+  dplyr::group_by(cluster) %>%
+  dplyr::group_split() %>%
+  purrr::map_dfr(function(df_state) {
+    state_id <- as.character(unique(df_state$cluster))
+    run_gsea_for_state(df_state = df_state, state_id = state_id, database = "Reactome")
+  }) %>%
+  dplyr::arrange(cluster, p.adjust)
+
+readr::write_csv(
+  reactome_gsea_pb,
+  file.path(output_dir, "pathway_Reactome_GSEA_pseudobulk_refined_states_TNFR2a_vs_Control.csv")
+)
+```
+
+```{r}
+#| label: fig-reactome-gsea-pseudobulk
+#| message: false
+#| warning: false
+#| fig-width: 14
+#| fig-height: 9
+#| fig-dpi: 300
+#| fig-cap: "Significant Reactome GSEA terms from pseudobulk-ranked genes."
+
+plot_df <- reactome_gsea_pb %>%
+  dplyr::filter(!is.na(p.adjust), p.adjust < plot_fdr_cutoff) %>%
+  dplyr::mutate(
+    minus_log10_fdr = -log10(p.adjust),
+    Description = stringr::str_wrap(Description, width = 45)
+  ) %>%
+  dplyr::group_by(cluster, cluster_label) %>%
+  dplyr::slice_max(order_by = abs(NES), n = top_n_plot, with_ties = FALSE) %>%
+  dplyr::ungroup()
+
+if (nrow(plot_df) == 0) {
+  plot_empty(paste0("No significant Reactome GSEA terms at FDR < ", plot_fdr_cutoff))
+} else {
+  ggplot2::ggplot(
+    plot_df,
+    ggplot2::aes(x = NES, y = stats::reorder(Description, NES), size = setSize, colour = minus_log10_fdr)
+  ) +
+    ggplot2::geom_vline(xintercept = 0, linewidth = 0.3) +
+    ggplot2::geom_point(alpha = 0.85) +
+    ggplot2::facet_wrap(~ cluster_label, scales = "free_y", ncol = 2) +
+    ggplot2::labs(
+      x = "Normalized enrichment score (NES)",
+      y = NULL,
+      size = "Gene set size",
+      colour = expression(-log[10]("FDR"))
+    ) +
+    ggplot2::theme_bw(base_size = 11) +
+    ggplot2::theme(
+      strip.text = ggplot2::element_text(size = 9),
+      axis.text.y = ggplot2::element_text(size = 7)
+    )
+}
+```
+
+## GO Biological Process GSEA
+
+```{r}
+#| label: go-bp-gsea-pseudobulk
+#| message: false
+#| warning: false
+
+go_bp_gsea_pb <- pb_de_entrez %>%
+  dplyr::group_by(cluster) %>%
+  dplyr::group_split() %>%
+  purrr::map_dfr(function(df_state) {
+    state_id <- as.character(unique(df_state$cluster))
+    run_gsea_for_state(df_state = df_state, state_id = state_id, database = "GO_BP")
+  }) %>%
+  dplyr::arrange(cluster, p.adjust)
+
+readr::write_csv(
+  go_bp_gsea_pb,
+  file.path(output_dir, "pathway_GO_BP_GSEA_pseudobulk_refined_states_TNFR2a_vs_Control.csv")
+)
+```
+
+```{r}
+#| label: fig-go-bp-gsea-pseudobulk
+#| message: false
+#| warning: false
+#| fig-width: 14
+#| fig-height: 9
+#| fig-dpi: 300
+#| fig-cap: "Significant GO Biological Process GSEA terms from pseudobulk-ranked genes."
+
+plot_df <- go_bp_gsea_pb %>%
+  dplyr::filter(!is.na(p.adjust), p.adjust < plot_fdr_cutoff) %>%
+  dplyr::mutate(
+    minus_log10_fdr = -log10(p.adjust),
+    Description = stringr::str_wrap(Description, width = 45)
+  ) %>%
+  dplyr::group_by(cluster, cluster_label) %>%
+  dplyr::slice_max(order_by = abs(NES), n = top_n_plot, with_ties = FALSE) %>%
+  dplyr::ungroup()
+
+if (nrow(plot_df) == 0) {
+  plot_empty(paste0("No significant GO BP GSEA terms at FDR < ", plot_fdr_cutoff))
+} else {
+  ggplot2::ggplot(
+    plot_df,
+    ggplot2::aes(x = NES, y = stats::reorder(Description, NES), size = setSize, colour = minus_log10_fdr)
+  ) +
+    ggplot2::geom_vline(xintercept = 0, linewidth = 0.3) +
+    ggplot2::geom_point(alpha = 0.85) +
+    ggplot2::facet_wrap(~ cluster_label, scales = "free_y", ncol = 2) +
+    ggplot2::labs(
+      x = "Normalized enrichment score (NES)",
+      y = NULL,
+      size = "Gene set size",
+      colour = expression(-log[10]("FDR"))
+    ) +
+    ggplot2::theme_bw(base_size = 11) +
+    ggplot2::theme(
+      strip.text = ggplot2::element_text(size = 9),
+      axis.text.y = ggplot2::element_text(size = 7)
+    )
+}
+```
+
+## Integrated pathway summary
+
+```{r}
+#| label: integrated-pathway-summary
+#| message: false
+#| warning: false
+
+ora_all_pb <- dplyr::bind_rows(kegg_ora_pb, reactome_ora_pb, go_bp_ora_pb) %>%
+  dplyr::mutate(method = "ORA")
+
+gsea_all_pb <- dplyr::bind_rows(kegg_gsea_pb, reactome_gsea_pb, go_bp_gsea_pb) %>%
+  dplyr::mutate(method = "GSEA")
+
+pathway_summary_all_pb <- dplyr::bind_rows(
+  ora_all_pb %>%
+    dplyr::select(method, database, cluster, cluster_label, Direction, ID, Description, pvalue, p.adjust, dplyr::any_of(c("Count", "GeneRatio"))),
+  gsea_all_pb %>%
+    dplyr::select(method, database, cluster, cluster_label, Direction, ID, Description, pvalue, p.adjust, dplyr::any_of(c("NES", "setSize", "core_enrichment")))
+) %>%
+  dplyr::arrange(method, database, cluster, p.adjust)
+
+readr::write_csv(
+  pathway_summary_all_pb,
+  file.path(output_dir, "pathway_integrated_summary_pseudobulk_refined_states_TNFR2a_vs_Control.csv")
+)
+
+pathway_top_summary <- pathway_summary_all_pb %>%
+  dplyr::filter(!is.na(p.adjust), p.adjust < plot_fdr_cutoff) %>%
+  dplyr::group_by(method, database, cluster, cluster_label, Direction) %>%
+  dplyr::slice_min(order_by = p.adjust, n = 5, with_ties = FALSE) %>%
+  dplyr::ungroup() %>%
+  dplyr::arrange(cluster, method, database, Direction, p.adjust)
+
+readr::write_csv(
+  pathway_top_summary,
+  file.path(output_dir, "pathway_top_significant_terms_pseudobulk_refined_states_TNFR2a_vs_Control.csv")
+)
+```
+
+```{r}
+#| label: tbl-integrated-pathway-summary
+#| message: false
+#| warning: false
+#| tbl-cap: "Top significant pathway terms across ORA and GSEA based on pseudobulk DE."
+
+if (nrow(pathway_top_summary) == 0) {
+  tibble::tibble(message = paste0("No pathway terms passed FDR < ", plot_fdr_cutoff, ". Review full exported tables for nominal or trend-level results.")) %>%
+    knitr::kable()
+} else {
+  pathway_top_summary %>%
+    dplyr::select(method, database, cluster, cluster_label, Direction, Description, p.adjust, dplyr::any_of(c("NES", "Count", "GeneRatio"))) %>%
+    dplyr::mutate(p.adjust = formatC(p.adjust, format = "e", digits = 2)) %>%
+    knitr::kable(align = "c")
+}
+```
+
+```{r}
+#| label: tbl-pathway-recurrence-shared
+#| message: false
+#| warning: false
+#| tbl-cap: "GSEA terms (FDR < 0.05) recurring in at least 4 refined states with the same direction. GO terms overlap heavily, so counts overlap between related terms."
+
+gsea_sig <- gsea_all_pb %>%
+  dplyr::filter(!is.na(p.adjust), p.adjust < plot_fdr_cutoff, is.finite(NES)) %>%
+  dplyr::mutate(dir = ifelse(NES > 0, "Higher in TNFR2a", "Higher in Control"))
+
+pathway_recurrence <- gsea_sig %>%
+  dplyr::group_by(database, Description, dir) %>%
+  dplyr::summarise(
+    n_states = dplyr::n_distinct(cluster),
+    states = paste(sort(unique(cluster_label)), collapse = ", "),
+    mean_NES = round(mean(NES), 2),
+    .groups = "drop"
+  ) %>%
+  dplyr::arrange(dplyr::desc(n_states), dplyr::desc(abs(mean_NES)))
+
+readr::write_csv(
+  pathway_recurrence,
+  file.path(output_dir, "pathway_GSEA_recurrence_across_states.csv")
+)
+
+pathway_recurrence %>%
+  dplyr::filter(n_states >= 4) %>%
+  dplyr::slice_head(n = 30) %>%
+  knitr::kable(align = "c")
+```
+
+```{r}
+#| label: tbl-pathway-state-restricted
+#| message: false
+#| warning: false
+#| tbl-cap: "GSEA terms (FDR < 0.05) seen in a single refined state (top 4 per state and direction by |NES|). Small states and Unresolved_state are exploratory."
+
+gsea_sig %>%
+  dplyr::group_by(database, Description, dir) %>%
+  dplyr::mutate(n_states = dplyr::n_distinct(cluster)) %>%
+  dplyr::ungroup() %>%
+  dplyr::filter(n_states == 1) %>%
+  dplyr::group_by(cluster_label, dir) %>%
+  dplyr::slice_max(order_by = abs(NES), n = 4, with_ties = FALSE) %>%
+  dplyr::ungroup() %>%
+  dplyr::arrange(cluster_label, dir, dplyr::desc(abs(NES))) %>%
+  dplyr::select(cluster_label, dir, database, Description, NES, p.adjust) %>%
+  dplyr::mutate(NES = round(NES, 2), p.adjust = signif(p.adjust, 2)) %>%
+  knitr::kable(align = "c")
+```
+
+## Optional exploratory single-cell pathway analysis
+
+This section is intentionally marked exploratory. It is only evaluated if the single-cell DE file exists. These results may be useful for candidate discovery, but they should not be interpreted as the primary pathway evidence because single-cell differential expression does not model biological replication.
+
+```{r}
+#| label: optional-single-cell-pathway-input
+#| message: false
+#| warning: false
+#| eval: true
+
+sc_de_file_candidates <- c(
+  file.path(output_dir, "singlecell_DE_within_refined_state_allcells_TNFR2a_vs_Control.csv"),
+  file.path(output_dir, "singlecell_DE_within_cluster_allcells_TNFR2a_vs_Control.csv")
+)
+
+sc_de_file <- sc_de_file_candidates[file.exists(sc_de_file_candidates)][1]
+
+if (is.na(sc_de_file)) {
+  sc_de_available <- FALSE
+  sc_de <- tibble::tibble()
+} else {
+  sc_de_available <- TRUE
+  sc_de <- readr::read_csv(sc_de_file, show_col_types = FALSE)
+
+  sc_fc_col <- dplyr::case_when(
+    "avg_log2FC" %in% colnames(sc_de) ~ "avg_log2FC",
+    "avg_logFC" %in% colnames(sc_de) ~ "avg_logFC",
+    TRUE ~ NA_character_
+  )
+
+  if (is.na(sc_fc_col)) {
+    warning("Single-cell DE file found, but no avg_log2FC/avg_logFC column was detected. Skipping exploratory single-cell pathway analysis.")
+    sc_de_available <- FALSE
+    sc_de <- tibble::tibble()
+  }
+}
+
+sc_de_available
+```
+
+```{r}
+#| label: exploratory-single-cell-kegg-gsea
+#| message: false
+#| warning: false
+#| eval: true
+
+if (sc_de_available) {
+  sc_de_prepared <- sc_de %>%
+    dplyr::mutate(
+      gene = as.character(gene),
+      cluster = as.character(cluster),
+      cluster = factor(cluster, levels = state_levels),
+      cluster_label = get_state_label(cluster),
+      logFC = as.numeric(.data[[sc_fc_col]]),
+      p_val_adj = as.numeric(p_val_adj),
+      rank_score = dplyr::case_when(
+        is.finite(p_val_adj) & p_val_adj > 0 & is.finite(logFC) ~ sign(logFC) * -log10(p_val_adj),
+        is.finite(logFC) ~ logFC,
+        TRUE ~ NA_real_
+      ),
+      ENTREZID = sym2ent_mm_vec(gene),
+      ENTREZID = as.character(ENTREZID)
+    ) %>%
+    dplyr::filter(!is.na(cluster), !is.na(gene), !is.na(ENTREZID), ENTREZID != "")
+
+  sc_kegg_gsea_exploratory <- sc_de_prepared %>%
+    dplyr::group_by(cluster) %>%
+    dplyr::group_split() %>%
+    purrr::map_dfr(function(df_state) {
+      state_id <- as.character(unique(df_state$cluster))
+      run_gsea_for_state(
+        df_state = df_state,
+        state_id = state_id,
+        database = "KEGG",
+        term2gene = KEGG_TERM2GENE,
+        term2name = KEGG_TERM2NAME
+      )
+    })
+
+  if (nrow(sc_kegg_gsea_exploratory) > 0) {
+    sc_kegg_gsea_exploratory <- sc_kegg_gsea_exploratory %>%
+      dplyr::arrange(cluster, p.adjust)
+  }
+
+  readr::write_csv(
+    sc_kegg_gsea_exploratory,
+    file.path(output_dir, "pathway_KEGG_GSEA_exploratory_singlecell_refined_states_TNFR2a_vs_Control.csv")
+  )
+} else {
+  sc_kegg_gsea_exploratory <- tibble::tibble()
+}
+```
+
+## Interpretation
+
+### Pathway patterns across refined states
+
+Pathway analysis used pseudobulk statistics from the full gene set, so the genes shared across states are included (see the switch above). Enrichment was run with clusterProfiler and ReactomePA [@wu2021clusterprofiler].
+
+Three themes recur across states in the GSEA results:
+
+- **Type I interferon response.** Gene sets for responses to interferon-β and type I interferon are enriched among genes higher in TNFR2a mice in the naive-like, activated/memory-like and Treg tissue-like states. TNFR2 signalling activates NF-κB, and interferon-stimulated genes are a known secondary response in activated lymphocytes, so this is a plausible systemic effect of treatment. Note that the IFN-response state itself is a separate cluster, so this signal comes from cells outside it.
+- **Antigen processing and presentation.** These gene sets are higher in TNFR2a mice in Treg tissue-like, cycling and Th2/tissue-like cells, driven by *Cd74* and MHC class II genes. Mouse T cells do not normally synthesise MHC class II, so this signal may come from acquired antigen-presenting-cell material, or from closely associated antigen-presenting cells in activated, tissue-resident populations, and is not read as T-cell antigen presentation.
+- **Effector function in Th1/cytotoxic-like cells.** Cytotoxicity-related gene sets shift between arms within the Th1/cytotoxic-like state, in line with the modest activation signals in the differential expression chapter.
+
+Ribosome biogenesis and translation gene sets are lower in TNFR2a mice in the unresolved state. That state is a mixture of technical clusters and is not interpreted.
+
+Pathway results based on ranked pseudobulk statistics treat genes as independent, and overlap between gene sets inflates the apparent agreement between related terms. With four mice per condition, all results are hypothesis-generating.
+
+### Key findings
+
+- TNFR2 agonism is associated with a type I interferon response signature across several CD4⁺ states.
+- Antigen-presentation gene sets (*Cd74*, MHC class II) rise in TNFR2a-expanded tissue Treg and cycling cells, which most likely reflects acquired material or associated antigen-presenting cells, not intrinsic T-cell expression.
+- State-specific effector changes in Th1/cytotoxic-like cells are modest.
+- Results for small states (Th2/tissue-like, IL-17-like) and the unresolved state are exploratory.
+
+## Summary
+
+This chapter used ORA and GSEA on replicate-aware pseudobulk differential expression to ask which biological programs differ between TNFR2a and control mice within each refined CD4⁺ T-cell state. The dominant pathway-level signals are a shared type I interferon response and higher antigen-presentation genes in the TNFR2a-expanded tissue Treg and cycling compartments. These complement the composition and gene-level findings of the earlier chapters.

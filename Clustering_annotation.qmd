@@ -1,0 +1,568 @@
+---
+title: "Cluster Annotation"
+execute: 
+  echo: true
+  message: false
+  warning: false
+
+---
+
+```{r}
+#| label: setup
+#| message: false
+#| warning: false
+
+source("R/setup.R")
+source("R/helpers.R")
+```
+
+## Overview
+
+This chapter performs the biological review of the provisional high-resolution clustering generated in the dimensionality reduction step. Using cluster-resolved marker gene expression and canonical immune marker panels, the goal is to evaluate whether transcriptionally defined clusters correspond to biologically meaningful T-cell states, reflect contaminating populations, or represent over-partitioned substructure.
+
+The analysis integrates multiple lines of evidence, including cluster-specific marker genes, canonical marker expression patterns, distribution across samples and conditions, and cell-cycle state. These complementary views allow clusters to be interpreted in context rather than based on any single metric.
+
+Importantly, the clustering evaluated here is treated as a provisional high-resolution scaffold (`cluster_primary`). The objective is not to assign final cell identities at this stage, but to identify coherent biological states, flag clusters requiring merging or removal, and generate an evidence base for subsequent clustering refinement. The outputs of this chapter therefore directly inform the revised clustering workflow.
+
+```{r}
+#| label: load-clustered-object-and-markers
+#| message: false
+#| warning: false
+
+df <- readRDS("data/TCRseq_integrated_cluster_primary.rds")
+DEGS_cluster_primary <- readRDS("data/DEGS_cluster_primary_res1.1.rds")
+
+DefaultAssay(df) <- "SCT"
+Idents(df) <- "cluster_primary"
+```
+
+```{r}
+#| label: object-checks
+#| message: false
+#| warning: false
+#| include: false
+
+table(Idents(df))
+table(df$orig.ident)
+table(df$Condition, useNA = "ifany")
+```
+
+## Cluster overview
+
+```{r}
+#| label: fig-umap-cluster-overview
+#| message: false
+#| warning: false
+#| fig-cap: "UMAP of the Harmony embedding coloured by the provisional working clustering used for annotation review."
+#| fig-width: 7
+#| fig-height: 5
+#| fig-dpi: 300
+
+DimPlot(
+  df,
+  reduction = "umap",
+  group.by = "cluster_primary",
+  label = TRUE,
+  repel = TRUE
+)
+```
+
+The provisional working clustering provides the transcriptional framework for annotation. Marker discovery and canonical gene expression patterns were interpreted in the context of this embedding to determine whether clusters correspond to biologically distinct T-cell states or reflect non-target or contaminating populations, as well as to identify potentially over-partitioned substructure.
+
+## Top marker genes per cluster
+
+To identify the defining transcriptional features of each cluster, differentially expressed genes were ranked by average log2 fold-change. These marker genes provide the primary evidence for biological annotation and help distinguish naïve-like, activated, regulatory, cycling, interferon-responsive, or stress-associated states.
+
+```{r}
+#| label: tbl-top-markers-per-cluster
+#| include: false
+
+top_markers <- DEGS_cluster_primary %>%
+  dplyr::filter(avg_log2FC > 0) %>%
+  dplyr::group_by(cluster) %>%
+  dplyr::slice_max(order_by = avg_log2FC, n = 10, with_ties = FALSE) %>%
+  dplyr::ungroup()
+```
+
+```{r}
+#| label: save-top-markers-table
+#| message: false
+#| warning: false
+
+readr::write_csv(top_markers, "data/top_markers_cluster_primary.csv")
+```
+
+```{r}
+#| label: tbl-top-markers-summary
+#| message: false
+#| warning: false
+#| tbl-cap: "Top three positive marker genes per provisional cluster (descriptive overview)."
+
+top_markers_summary <- DEGS_cluster_primary %>%
+  dplyr::filter(avg_log2FC > 0) %>%
+  dplyr::group_by(cluster) %>%
+  dplyr::slice_max(order_by = avg_log2FC, n = 3, with_ties = FALSE) %>%
+  dplyr::summarise(
+    top3_markers = paste(gene, collapse = ", "),
+    .groups = "drop"
+  )
+
+knitr::kable(top_markers_summary)
+```
+
+```{r}
+#| label: tbl-top-10-markers-summary
+#| message: false
+#| warning: false
+#| tbl-cap: "Top ten positive marker genes per provisional cluster (descriptive overview). Predicted genes (Gm*, *Rik) were excluded from this display only."
+
+top_markers_summary <- DEGS_cluster_primary %>%
+  dplyr::filter(
+    avg_log2FC > 0,
+    !grepl("^Gm[0-9]|Rik$", gene),   # drop predicted genes (display only)
+    pct.1 > 0.25,                    # expressed in >25% of the cluster
+    pct.2 < pct.1                    # more common in cluster than elsewhere
+  ) %>%
+  dplyr::group_by(cluster) %>%
+  dplyr::slice_max(order_by = avg_log2FC, n = 10, with_ties = FALSE) %>%
+  dplyr::summarise(
+    top10_markers = paste(gene, collapse = ", "),
+    .groups = "drop"
+  )
+
+knitr::kable(top_markers_summary)
+```
+
+## Canonical marker-guided annotation
+
+Cluster identities were evaluated using a curated set of canonical immune marker genes relevant to naïve-like, activated, regulatory, cytotoxic, proliferative, interferon-responsive, and stress-associated states. Particular attention was given to genes associated with naïve or central-memory-like states, activation, regulatory T cells, proliferation, interferon response, and immediate-early or stress-associated transcriptional programs.
+
+```{r}
+#| label: define-canonical-marker-panel
+#| message: false
+#| warning: false
+
+marker_panel <- c(
+  # Naive
+  "Sell", "Ccr7", "Lef1", "Il7r", "Tcf7",
+  # Activation / memory
+  "Cd44", "Icos", "Cd69", "Tnfsf8",
+  # Th1 / cytotoxic
+  "Tbx21", "Ifng", "Nkg7", "Ccl5", "Gzma",
+  # Th2 / tissue
+  "Gata3", "Il1rl1", "Arg1",
+  # Type-17
+  "Rorc", "Il23r", "Il17a",
+  # Treg
+  "Foxp3", "Il2ra", "Ctla4", "Izumo1r",
+  # Tissue Treg / TNFR2
+  "Tnfrsf1b", "Klrg1", "Areg", "Tnfrsf9",
+  # IFN
+  "Ifit1", "Isg15",
+  # Proliferation
+  "Mki67", "Top2a",
+  # Non-target populations
+  "Cd8a", "Cd8b1", "Zbtb16", "Klrb1c", "Cd19", "H2-Aa"
+)
+
+marker_panel <- unique(marker_panel)
+marker_panel <- marker_panel[marker_panel %in% rownames(df)]
+```
+
+```{r}
+#| label: fig-dotplot-canonical-markers
+#| message: false
+#| warning: false
+#| fig-cap: "Canonical marker gene expression across provisional clusters."
+#| fig-width: 10
+#| fig-height: 12
+
+DotPlot(
+  df,
+  features = marker_panel,
+  group.by = "cluster_primary",
+  assay = "SCT"
+) +
+  coord_flip() +
+  theme_bw() +
+  theme(
+    axis.text.y = element_text(size = 8),   # gene names
+    axis.text.x = element_text(size = 8),   # clusters
+    axis.title = element_blank()
+  )
+```
+
+The canonical marker dotplot provides a compact overview of the transcriptional programs associated with each cluster. Clusters enriched for Sell, Ccr7, Il7r, Tcf7, and Lef1 were considered compatible with naïve or central-memory-like T-cell states; expression of Cd44, Icos, Cd69, or Nr4 family genes supported activated states; Foxp3, Il2ra, Ctla4, and Ikzf2 supported regulatory T-cell identity; and Mki67, Top2a, or Stmn1 indicated proliferative states. Additional markers such as Cd8a/b1, Nkg7, Ccl5, Cd19, Ms4a1, H2-Aa, and Trdc/Trgc genes were included to identify clusters potentially representing non-target, cytotoxic, B-cell, antigen-presenting, or γδ-like populations. These patterns were used to guide provisional review rather than to impose final cell identities.
+
+## Cluster distribution across samples and conditions
+
+Cluster interpretation was further informed by the distribution of cells across biological replicates and treatment groups. Strong representation across multiple samples supports the robustness of a cluster, whereas marked restriction to a single sample may indicate either a private biological population or a potential technical effect. Condition-level enrichment may highlight treatment-associated states but was not used alone to define biological identity.
+
+```{r}
+#| label: tbl-cluster-by-sample
+#| message: false
+#| warning: false
+#| tbl-cap: "Cell counts per sample for each cluster."
+#| include: false
+
+cluster_sample_tab <- table(
+  Cluster = df$cluster_primary,
+  Sample = df$orig.ident
+)
+
+knitr::kable(as.data.frame.matrix(cluster_sample_tab))
+```
+
+Because the integrated dataset remained provisional at this stage and included clusters requiring further review for possible non-target or contaminating identities, cluster composition across samples and conditions was interpreted descriptively and not as formal evidence of biological enrichment.
+
+```{r}
+#| label: tbl-cluster-by-condition
+#| message: false
+#| warning: false
+#| tbl-cap: "Cell counts per condition for each cluster."
+#| include: false
+
+cluster_condition_tab <- table(
+  Cluster = df$cluster_primary,
+  Condition = df$Condition
+)
+
+knitr::kable(as.data.frame.matrix(cluster_condition_tab))
+```
+
+```{r}
+#| label: fig-cluster-condition-composition
+#| message: false
+#| warning: false
+#| fig-cap: "Relative composition of each cluster by treatment condition."
+#| fig-width: 8
+#| fig-height: 5
+#| fig-dpi: 300
+
+cluster_condition_prop <- df@meta.data %>%
+  dplyr::count(cluster_primary, Condition) %>%
+  dplyr::group_by(cluster_primary) %>%
+  dplyr::mutate(prop = n / sum(n))
+
+ggplot(cluster_condition_prop, aes(x = cluster_primary, y = prop, fill = Condition)) +
+  geom_col(position = "fill") +
+  theme_bw() +
+  scale_y_continuous(labels = scales::percent_format()) +
+  labs(
+    x = "Cluster",
+    y = "Proportion of cells",
+    fill = "Condition"
+  ) +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+```
+
+## Additional cluster context
+
+```{r}
+#| label: fig-umap-clusters-by-sample
+#| message: false
+#| warning: false
+#| fig-cap: "UMAP embeddings split by sample and coloured by the provisional working clustering."
+#| fig-width: 12
+#| fig-height: 8
+#| fig-dpi: 300
+#| include: false
+
+DimPlot(
+  df,
+  reduction = "umap",
+  group.by = "cluster_primary",
+  split.by = "orig.ident",
+  label = FALSE,
+  ncol = 3,
+  pt.size = 0.2
+) + NoLegend()
+```
+
+```{r}
+#| label: fig-umap-clusters-by-condition
+#| message: false
+#| warning: false
+#| include: false
+#| fig-cap: "UMAP embeddings split by condition and coloured by the provisional working clustering."
+#| fig-width: 10
+#| fig-height: 5
+#| fig-dpi: 300
+
+DimPlot(
+  df,
+  reduction = "umap",
+  group.by = "cluster_primary",
+  split.by = "Condition",
+  label = FALSE,
+  pt.size = 0.2
+) + NoLegend()
+```
+
+```{r}
+#| label: fig-phase-by-cluster
+#| message: false
+#| warning: false
+#| fig-cap: "Distribution of cell-cycle phase assignments across clusters."
+#| fig-width: 8
+#| fig-height: 5
+#| fig-dpi: 300
+
+phase_prop <- df@meta.data %>%
+  dplyr::count(cluster_primary, Phase) %>%
+  dplyr::group_by(cluster_primary) %>%
+  dplyr::mutate(prop = n / sum(n))
+
+ggplot(phase_prop, aes(x = cluster_primary, y = prop, fill = Phase)) +
+  geom_col(position = "fill") +
+  theme_bw() +
+  scale_y_continuous(labels = scales::percent_format()) +
+  labs(
+    x = "Cluster",
+    y = "Proportion of cells",
+    fill = "Phase"
+  ) +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+```
+
+Cell-cycle phase distributions were also reviewed to identify clusters primarily driven by proliferative state rather than broader functional identity. Clusters dominated by S or G2/M phase cells were interpreted cautiously and considered candidate cycling subpopulations rather than independent terminal cell states.
+
+```{r}
+#| label: tbl-annotation-worksheet
+#| message: false
+#| warning: false
+#| include: false
+#| tbl-cap: "Annotation worksheet summarising top markers and provisional interpretation for each cluster."
+
+cluster_sizes <- df@meta.data %>%
+  dplyr::count(cluster_primary, name = "n_cells")
+
+annotation_worksheet <- top_markers %>%
+  dplyr::group_by(cluster) %>%
+  dplyr::summarise(
+    top_markers = paste(gene, collapse = ", "),
+    .groups = "drop"
+  ) %>%
+  dplyr::left_join(cluster_sizes, by = c("cluster" = "cluster_primary")) %>%
+  dplyr::mutate(
+    provisional_annotation = NA_character_,
+    merge_candidate_with = NA_character_,
+    review_flag = NA_character_,
+    notes = NA_character_
+  )
+
+knitr::kable(annotation_worksheet)
+```
+
+```{r}
+#| label: save-annotation-worksheet
+#| message: false
+#| warning: false
+
+readr::write_csv(annotation_worksheet, "data/annotation_worksheet_cluster_primary.csv")
+```
+
+```{r}
+#| label: tbl-diagnostic-marker-review
+#| message: false
+#| warning: false
+#| include: false
+#| tbl-cap: "Average expression of selected diagnostic markers across provisional clusters."
+
+diagnostic_markers <- c(
+  "Cd3e", "Cd4", "Cd8a", "Cd8b1", "Foxp3", "Nkg7", "Ccl5",
+  "Zbtb16", "Klrb1c", "Cd19", "H2-Aa", "Rorc", "Mki67", "Gphn"
+)
+diagnostic_markers <- diagnostic_markers[diagnostic_markers %in% rownames(df)]
+
+avg_diag <- AverageExpression(
+  df,
+  assays = "SCT",
+  features = diagnostic_markers,
+  group.by = "cluster_primary",
+  return.seurat = FALSE
+)$SCT
+
+knitr::kable(round(avg_diag, 2))
+```
+
+## Cross-check against the deposited annotation
+
+The authors' cell-type labels were carried through preprocessing as `author_label` but were not used for clustering. Comparing them with the provisional clusters is an independent check on the annotation: clusters that are mostly one author label support the marker-based reading, and mixed clusters point to places where the two annotations draw boundaries differently.
+
+```{r}
+#| label: fig-author-label-crosscheck
+#| fig-cap: "Composition of each provisional cluster by the authors' deposited cell-type label."
+#| fig-width: 9
+#| fig-height: 5
+
+df@meta.data %>%
+  dplyr::count(cluster_primary, author_label) %>%
+  dplyr::group_by(cluster_primary) %>%
+  dplyr::mutate(prop = n / sum(n)) %>%
+  ggplot(aes(x = cluster_primary, y = prop, fill = author_label)) +
+  geom_col() +
+  scale_y_continuous(labels = scales::percent_format()) +
+  scale_fill_brewer(palette = "Set2") +
+  labs(x = "Provisional cluster", y = "Proportion of cells", fill = "Author label") +
+  theme_bw()
+```
+
+## Diagnostic marker review
+
+```{r}
+#| label: fig-diagnostic-marker-dotplot
+#| message: false
+#| warning: false
+#| fig-cap: "Diagnostic marker expression across provisional clusters."
+#| fig-width: 7
+#| fig-height: 5.5
+#| fig-dpi: 300
+
+DotPlot(
+  df,
+  features = diagnostic_markers,
+  group.by = "cluster_primary",
+  assay = "SCT"
+) +
+  RotatedAxis() +
+  theme_bw()
+```
+
+
+### TCR recovery per cluster
+
+TCR recovery is a useful extra annotation signal. Conventional αβ T cells should carry TRA/TRB chains in most cells, whereas low recovery can point to low-quality cells, γδ T cells or non-T contaminants. Only productive TRA/TRB CDR3s were deposited for this dataset, so γδ chains cannot be checked directly.
+
+```{r}
+#| label: tbl-cluster-tcr-chain-check
+#| message: false
+#| warning: false
+#| tbl-cap: "Fraction of cells per provisional cluster with TRA/TRB or TRD/TRG contigs, from raw contig annotations (all chains retained)."
+
+vdj_contigs_list <- readRDS("data/vdj_contigs_list.rds")
+vdj_all <- dplyr::bind_rows(vdj_contigs_list, .id = "sample_list_name")
+
+# Barcode suffix per sample, as used in the TCR clonotype chapter
+suffix_map <- setNames(sample_suffix_map$suffix, sample_suffix_map$sample)
+
+stopifnot(all(unique(vdj_all$sample_list_name) %in% names(suffix_map)))
+
+vdj_all <- vdj_all %>%
+  dplyr::mutate(
+    cell = paste0(
+      sub("(_\\d+)$", "", barcode),
+      suffix_map[sample_list_name]
+    )
+  )
+
+# Sanity check 1: the suffix map must agree with the object
+suffix_check <- table(sub(".*_", "", colnames(df)), df$orig.ident)
+print(suffix_check)
+
+# Sanity check 2: contig cells must be found in the object
+frac_found <- mean(unique(vdj_all$cell) %in% colnames(df))
+message("Fraction of contig cells found in object: ", round(frac_found, 3))
+if (frac_found < 0.5) {
+  stop("Fewer than 50% of contig barcodes match the object. Check the suffix map before interpreting this table.")
+}
+
+# Which chains are present in the raw data?
+print(table(vdj_all$chain, vdj_all$productive, useNA = "ifany"))
+
+chain_by_cell <- vdj_all %>%
+  dplyr::filter(chain %in% c("TRA", "TRB", "TRD", "TRG")) %>%
+  dplyr::group_by(cell) %>%
+  dplyr::summarise(
+    has_TRA_TRB          = any(chain %in% c("TRA", "TRB")),
+    has_TRD_TRG_any      = any(chain %in% c("TRD", "TRG")),
+    has_TRD_TRG_prod     = any(chain %in% c("TRD", "TRG") & productive %in% TRUE),
+    .groups = "drop"
+  )
+
+md_chain <- df@meta.data %>%
+  tibble::rownames_to_column("cell") %>%
+  dplyr::left_join(chain_by_cell, by = "cell") %>%
+  dplyr::mutate(has_contig = !is.na(has_TRA_TRB))
+
+cluster_tcr_chain_check <- md_chain %>%
+  dplyr::group_by(cluster_primary) %>%
+  dplyr::summarise(
+    n_cells             = dplyr::n(),
+    pct_with_contig     = round(100 * mean(has_contig), 1),
+    pct_TRA_TRB         = round(100 * mean(has_TRA_TRB %in% TRUE), 1),
+    pct_TRD_TRG_any     = round(100 * mean(has_TRD_TRG_any %in% TRUE), 1),
+    pct_TRD_TRG_prod    = round(100 * mean(has_TRD_TRG_prod %in% TRUE), 1),
+    .groups = "drop"
+  ) %>%
+  dplyr::arrange(as.numeric(as.character(cluster_primary)))
+
+readr::write_csv(cluster_tcr_chain_check, "data/cluster_primary_tcr_chain_check.csv")
+
+knitr::kable(cluster_tcr_chain_check, align = "c")
+```
+
+TCR chains were recovered for more than 90% of cells in most clusters. The exceptions are informative. Cluster 13, which also has the lowest gene complexity and reduced *Cd3e*, has TCR chains in only about 10% of cells and is treated as low quality. Clusters 14 (type-17) and 15 (Th2/tissue) have somewhat lower recovery (about 65–80%). This is compatible with lower TCR transcript levels in these effector states, but a small innate-like or γδ component cannot be excluded without γδ chain data.
+
+```{r}
+#| label: define-provisional-annotations
+#| message: false
+#| warning: false
+#| include: false
+
+cluster_to_annotation <- c(
+  # "0" = "Naive-like CD4 T",
+  # "1" = "Activated CD4 T",
+  # "2" = "Treg",
+  # "3" = "Cycling CD4 T"
+)
+
+df$celltype_annotation <- "Unassigned"
+
+if (length(cluster_to_annotation) > 0) {
+  df$celltype_annotation <- dplyr::recode(
+    as.character(df$cluster_primary),
+    !!!cluster_to_annotation,
+    .default = "Unassigned"
+  )
+}
+```
+
+```{r}
+#| label: fig-umap-annotated
+#| message: false
+#| warning: false
+#| include: false
+#| fig-cap: "UMAP embedding coloured by provisional biological annotation."
+#| fig-width: 7
+#| fig-height: 5
+#| fig-dpi: 300
+
+if ("celltype_annotation" %in% colnames(df@meta.data)) {
+  DimPlot(
+    df,
+    reduction = "umap",
+    group.by = "celltype_annotation",
+    label = TRUE,
+    repel = TRUE
+  )
+} else {
+  plot.new()
+  text(0.5, 0.5, "Provisional annotation mapping not yet defined.", cex = 1)
+}
+```
+
+## Summary
+
+- **Naive-like (clusters 1, 2, 3, 4, 7).** Several clusters share a naive/resting program (*Sell*, *Lef1*, *Satb1*, *Dapl1*, *Igfbp4*) and sit next to each other in the UMAP, which is consistent with over-partitioning of one state. The authors' annotation labels almost all of these cells "T-Naive".
+- **Regulatory T cells (clusters 11 and 5).** Two clusters are Tregs, and they split into a resting/central state (cluster 11: *Foxp3*, *Il2ra*, *Ctla4*, *Izumo1r*, high *Sell*) and a tissue/effector state (cluster 5: *Klrg1*, *Il1rl1*, *Areg*, *Tnfrsf9*, *Tnfrsf4*, *Itgae*). The tissue state expresses the highest levels of *Tnfrsf1b*, the gene encoding TNFR2, and is strongly enriched in TNFR2a-treated mice. This agrees with the authors' "NLT Treg" labels.
+- **Effector states.** Th1/cytotoxic-like cells (cluster 6: *Tbx21*, *Ifng*, *Ccl5*, *Nkg7*), an activated/memory-like state with low *Foxp3* (cluster 8: *Tnfsf8*, *Tnfsf11*, *Fasl*), a small type-17 cluster (14: *Rorc*, *Il23r*) and a small Th2/tissue cluster (15: *Gata3*, *Il1rl1*, *Arg1*).
+- **Programs that cut across lineages.** Interferon-stimulated (cluster 10) and cycling (cluster 9) clusters. Cycling cells are strongly over-represented in TNFR2a mice.
+- **Non-target and technical clusters.**
+  - Cluster 17 is CD8⁺ T cells (*Cd8a*, *Cd8b1*, no *Cd4*).
+  - Cluster 16 has an iNKT signature (*Zbtb16*, *Klrb1c*, *Il4*).
+  - Cluster 12 is dominated by long, intron-rich transcripts (*Gphn*, *Lars2*, *Camk1d*).
+  - Cluster 13 has low complexity and low TCR recovery.
+- **Agreement with the deposited annotation.** The authors' independent labels agree with this reading for the major compartments. The main difference is granularity: the effector and Th2/type-17 clusters defined here are merged into broader "Teff" or "NLT Treg" categories in the authors' scheme.
+
+These observations define the refinement decisions applied in the next chapter.

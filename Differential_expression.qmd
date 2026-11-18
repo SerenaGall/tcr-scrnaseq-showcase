@@ -1,0 +1,1498 @@
+---
+title: "Differential expression"
+execute:
+  echo: true
+  message: false
+  warning: false
+
+---
+
+```{r}
+#| label: setup
+#| message: false
+#| warning: false
+
+source("R/setup.R")
+source("R/helpers.R")
+```
+
+```{r}
+#| label: inputs
+#| message: false
+#| warning: false
+
+# Refined object: source of curated revised-state labels
+obj_refined <- readRDS("data/TCRseq_revised_clustering.rds")
+
+# Original integrated object: source of raw RNA counts
+obj_counts <- readRDS("data/TCRseq_integrated_cluster_primary.rds")
+
+state_levels <- state_levels_all
+
+# Recreate Condition if needed in either object
+for (nm in c("obj_refined", "obj_counts")) {
+  x <- get(nm)
+
+  if (!"Condition" %in% colnames(x@meta.data)) {
+    x$Condition <- dplyr::case_when(
+      grepl("^TNFR2a_", x$orig.ident) ~ "TNFR2a",
+      grepl("^Ctrl_", x$orig.ident)  ~ "Control",
+      TRUE ~ NA_character_
+    )
+  }
+
+  x$Condition <- factor(x$Condition, levels = c("Control", "TNFR2a"))
+  assign(nm, x)
+}
+
+stopifnot("cluster_revised" %in% colnames(obj_refined@meta.data))
+
+# Keep only cells present in the refined object
+common_cells <- intersect(colnames(obj_counts), colnames(obj_refined))
+
+if (length(common_cells) == 0) {
+  stop("No overlapping cells between raw-count object and refined object.")
+}
+
+obj <- subset(obj_counts, cells = common_cells)
+
+# Transfer refined labels onto the counts object
+obj$cluster_revised <- obj_refined@meta.data[colnames(obj), "cluster_revised"]
+
+stopifnot(setequal(state_levels, unique(as.character(obj$cluster_revised))))
+
+obj$cluster_revised <- factor(
+  as.character(obj$cluster_revised),
+  levels = state_levels
+)
+
+obj$Condition <- factor(as.character(obj$Condition), levels = c("Control", "TNFR2a"))
+
+Idents(obj) <- "cluster_revised"
+
+# Optional annotation column
+annotation_col <- NULL  # celltype_annotation is not yet populated; use revised state names
+
+# Basic checks
+stopifnot("cluster_revised" %in% colnames(obj@meta.data))
+stopifnot(all(colnames(obj) %in% colnames(obj_refined)))
+```
+
+## Overview
+
+Differential expression analysis was performed to identify transcriptional changes associated with treatment condition (TNFR2a versus Control) within refined CD4 T-cell states, independent of clonotype expansion status. This chapter provides a state-resolved transcriptional comparison that is later extended by clonotype-informed differential expression analysis.
+
+Two complementary frameworks were used: (i) pseudobulk differential expression, which aggregates counts at the sample-within-state level and enables replicate-aware inference using edgeR quasi-likelihood models, and (ii) single-cell differential expression using Seurat’s FindMarkers, which provides a more sensitive but less conservative view of transcriptional differences.
+
+Together, these approaches provide a structured assessment of treatment-associated gene regulation across the refined CD4 T-cell landscape, balancing statistical rigor with sensitivity to state-specific variation.
+
+## Pseudobulk differential expression: model setup and diagnostics
+
+To provide a conservative assessment of treatment-associated transcriptional changes, pseudobulk differential expression was evaluated at the sample-within-state level using replicate-aware edgeR quasi-likelihood models. Because each refined state represents a distinct transcriptional CD4 T-cell population, this framework is well suited to identifying treatment-associated regulation within biologically coherent states while controlling false positives at the replicate level.
+
+In practice, successful pseudobulk modelling depends on sufficient replicate representation and adequate expression within each refined state. Where these requirements were not met, states were retained in the diagnostic summary as not testable under the current pseudobulk framework rather than being forced through an underpowered model.
+
+The DEG tables generated here provide a state-resolved baseline for treatment-associated transcriptional changes. The following clonotype-informed differential expression chapter builds on this framework by asking whether TNFR2a-associated transcriptional effects are specifically detectable within expanded clonotypes and expanded Treg_tissue_like clonotypes.
+
+### Key pseudobulk DE genes across refined states
+
+Three patterns stand out in the pseudobulk results (FDR < 0.05 within state), each present in all four TNFR2a mice:
+
+1. **A Treg/activation program appears inside non-Treg states.** *Ikzf2* (Helios) is higher in TNFR2a mice in every state tested, and *Foxp3*, *Ccr8*, *Tnfrsf9* and *Nrp1* are higher in the naive-like and IFN-response states. These states are defined by their dominant program, so the most likely explanation is a larger admixture of Treg-like cells within them under TNFR2a, not conversion of conventional cells. Within-state differential expression always mixes changes of state composition with changes of gene regulation. The composition shift shown in the refinement chapter makes that distinction especially important here.
+2. **A quiescence program is reduced.** *Bach2*, *Satb1*, *Klf2*, *Foxp1* and *Dusp10* are lower in TNFR2a mice across most states. These transcription factors maintain naive and quiescent T-cell states, so their lower expression is consistent with broader T-cell activation.
+3. **Tissue Tregs move further along the effector program.** In Treg tissue-like cells, TNFR2a raises *Il1r2*, *Bhlhe40*, *Traf2*, *Cd74* and interferon-inducible genes and lowers *Satb1*, *Igfbp4* and *Ly6c1*, consistent with a more activated, effector-differentiated tissue Treg state. *Tnfrsf1b* itself is higher in Treg tissue-like and cycling cells.
+
+Immediate-early genes (*Fos*, *Jun*, *Junb*, *Ier2*, *Egr1*) are lower in TNFR2a mice in several states. These genes are sensitive to tissue dissociation and processing time, so this difference is noted but not interpreted biologically.
+
+### Statistical thresholds
+
+Differential expression significance was defined using a false discovery rate (FDR) threshold of 0.05 following Benjamini–Hochberg correction. For pseudobulk analysis, both global FDR (across all cluster–gene tests) and cluster-level FDR corrections were applied.
+
+No explicit log2 fold-change threshold was imposed during statistical testing; however, effect sizes are reported to support biological interpretation.
+
+For single-cell differential expression, significance was defined as Seurat-adjusted *p_val_adj* \< 0.05.
+
+```{r}
+#| label: debug-refined-state-metadata
+#| message: false
+#| warning: false
+
+state_condition_summary <- obj@meta.data %>%
+  dplyr::count(cluster_revised, Condition) %>%
+  dplyr::arrange(factor(cluster_revised, levels = state_levels), Condition)
+
+state_sample_summary <- obj@meta.data %>%
+  dplyr::count(cluster_revised, orig.ident, Condition) %>%
+  dplyr::arrange(factor(cluster_revised, levels = state_levels), Condition, orig.ident)
+
+state_sample_representation <- obj@meta.data %>%
+  dplyr::filter(!is.na(cluster_revised), !is.na(orig.ident), !is.na(Condition)) %>%
+  dplyr::group_by(cluster_revised, Condition) %>%
+  dplyr::summarise(
+    n_samples = dplyr::n_distinct(orig.ident),
+    samples = paste(sort(unique(orig.ident)), collapse = ", "),
+    .groups = "drop"
+  ) %>%
+  dplyr::arrange(factor(cluster_revised, levels = state_levels), Condition)
+
+knitr::kable(
+  state_condition_summary,
+  caption = "Cells per refined state and condition."
+)
+
+knitr::kable(
+  state_sample_representation,
+  caption = "Sample representation per refined state and condition."
+)
+```
+
+```{r}
+#| label: pb-build-counts-and-metadata
+#| message: false
+#| warning: false
+
+cluster_key <- "cluster_revised"
+cond_levels <- c("Control", "TNFR2a")
+
+obj2 <- obj
+
+if (!"RNA" %in% names(obj2@assays)) {
+  stop("RNA assay not found in counts object; pseudobulk DE requires raw RNA counts.")
+}
+
+DefaultAssay(obj2) <- "RNA"
+
+stopifnot(all(c(cluster_key, "orig.ident", "Condition") %in% colnames(obj2@meta.data)))
+
+obj2$cluster_revised <- factor(as.character(obj2$cluster_revised), levels = state_levels)
+obj2$Condition <- factor(as.character(obj2$Condition), levels = cond_levels)
+
+# Important for Seurat v5:
+# If counts are split across sample-specific RNA layers, JoinLayers combines them
+# so the count matrix contains all cells rather than only one sample/layer.
+if (inherits(obj2[["RNA"]], "Assay5")) {
+  obj2 <- SeuratObject::JoinLayers(obj2, assay = "RNA")
+}
+
+get_raw_counts <- function(seu, assay = "RNA") {
+  a <- seu[[assay]]
+
+  mat <- tryCatch(
+    SeuratObject::LayerData(seu, assay = assay, layer = "counts"),
+    error = function(e) NULL
+  )
+
+  if (!is.null(mat) && nrow(mat) > 0 && ncol(mat) > 0) {
+    return(mat)
+  }
+
+  mat <- tryCatch(
+    SeuratObject::GetAssayData(seu, assay = assay, slot = "counts"),
+    error = function(e) NULL
+  )
+
+  if (!is.null(mat) && nrow(mat) > 0 && ncol(mat) > 0) {
+    return(mat)
+  }
+
+  stop("Could not retrieve a usable raw RNA counts matrix after joining RNA layers.")
+}
+
+count_mat <- get_raw_counts(obj2, assay = "RNA")
+# Remove TCR variable/joining/constant segment genes: they reflect clone makeup, not treatment
+tcr_genes <- grep("^Tr[abdg][vjc]", rownames(count_mat), value = TRUE)
+count_mat <- count_mat[!rownames(count_mat) %in% tcr_genes, , drop = FALSE]
+count_mat <- as(count_mat, "dgCMatrix")
+
+if (nrow(count_mat) == 0 || ncol(count_mat) == 0) {
+  stop("Raw RNA count matrix is empty.")
+}
+
+cell_md <- obj2@meta.data %>%
+  tibble::rownames_to_column("cell") %>%
+  dplyr::transmute(
+    cell = cell,
+    cluster = as.character(.data[[cluster_key]]),
+    sample = as.character(orig.ident),
+    Condition = factor(as.character(Condition), levels = cond_levels)
+  ) %>%
+  dplyr::filter(
+    !is.na(cell),
+    !is.na(cluster),
+    cluster != "",
+    !is.na(sample),
+    sample != "",
+    !is.na(Condition)
+  ) %>%
+  dplyr::mutate(
+    cluster = factor(cluster, levels = state_levels)
+  )
+
+cells_before_alignment <- nrow(cell_md)
+
+cell_md <- cell_md %>%
+  dplyr::filter(cell %in% colnames(count_mat))
+
+cells_after_alignment <- nrow(cell_md)
+
+if (cells_after_alignment == 0) {
+  stop("No cells remain after aligning metadata to the raw count matrix.")
+}
+
+if (cells_after_alignment < cells_before_alignment * 0.95) {
+  warning(
+    paste0(
+      "Only ", cells_after_alignment, " of ", cells_before_alignment,
+      " metadata cells were found in the raw count matrix. Check cell barcode alignment."
+    )
+  )
+}
+
+count_mat <- count_mat[, cell_md$cell, drop = FALSE]
+
+pb_alignment_summary <- tibble::tibble(
+  metric = c(
+    "Cells in metadata before count alignment",
+    "Cells retained after count alignment",
+    "Genes in raw count matrix"
+  ),
+  value = c(
+    cells_before_alignment,
+    cells_after_alignment,
+    nrow(count_mat)
+  )
+)
+
+knitr::kable(
+  pb_alignment_summary,
+  caption = "Pseudobulk count-matrix alignment summary."
+)
+
+pb_design_check <- cell_md %>%
+  dplyr::count(cluster, sample, Condition) %>%
+  dplyr::group_by(cluster, Condition) %>%
+  dplyr::summarise(
+    n_samples = dplyr::n_distinct(sample),
+    total_cells = sum(n),
+    .groups = "drop"
+  ) %>%
+  dplyr::arrange(factor(cluster, levels = state_levels), Condition)
+
+knitr::kable(
+  pb_design_check,
+  caption = "Sample-level representation per refined state before pseudobulk aggregation."
+)
+
+group_df <- cell_md %>%
+  dplyr::distinct(cluster, sample, Condition) %>%
+  dplyr::arrange(factor(cluster, levels = state_levels), Condition, sample) %>%
+  dplyr::mutate(pb_key = paste(cluster, sample, sep = "___"))
+
+cell_md <- cell_md %>%
+  dplyr::mutate(pb_key = paste(cluster, sample, sep = "___"))
+
+pb_list <- lapply(group_df$pb_key, function(g) {
+  idx <- which(cell_md$pb_key == g)
+
+  if (length(idx) == 0) {
+    stop(paste("No cells found for pseudobulk group:", g))
+  }
+
+  Matrix::rowSums(count_mat[, idx, drop = FALSE])
+})
+
+pb <- do.call(cbind, pb_list)
+colnames(pb) <- group_df$pb_key
+pb <- as.matrix(pb)
+
+col_df <- group_df %>%
+  dplyr::transmute(
+    pb_key = pb_key,
+    cluster = as.character(cluster),
+    sample = sample,
+    Condition = factor(as.character(Condition), levels = cond_levels)
+  )
+
+stopifnot(identical(col_df$pb_key, colnames(pb)))
+
+keep_gene <- rowSums(pb) > 0
+keep_samp <- colSums(pb) > 0
+
+pb <- pb[keep_gene, keep_samp, drop = FALSE]
+col_df <- col_df[keep_samp, , drop = FALSE]
+
+stopifnot(nrow(pb) > 0, ncol(pb) > 0)
+
+pb_counts_by_cluster <- col_df %>%
+  dplyr::count(cluster, Condition) %>%
+  tidyr::pivot_wider(
+    names_from = Condition,
+    values_from = n,
+    values_fill = 0
+  ) %>%
+  dplyr::arrange(factor(cluster, levels = state_levels))
+
+knitr::kable(
+  pb_counts_by_cluster,
+  caption = "Number of pseudobulk sample-level profiles per refined state and condition."
+)
+```
+
+```{r}
+#| label: pb-edger-per-cluster
+#| message: false
+#| warning: false
+
+pb_by_cluster <- split(seq_len(nrow(col_df)), as.character(col_df$cluster))
+
+run_pb_edger <- function(count_mat, sample_meta, cond_levels = c("Control", "TNFR2a")) {
+
+  sample_meta <- droplevels(sample_meta)
+
+  cond_tab <- table(sample_meta$Condition)
+
+  if (!all(cond_levels %in% names(cond_tab))) {
+    return(list(result = NULL, reason = "missing_condition"))
+  }
+
+  # Require at least 2 pseudobulk profiles per condition for edgeR QL
+  if (any(cond_tab[cond_levels] < 2)) {
+    return(list(result = NULL, reason = "too_few_replicates"))
+  }
+
+  dge <- edgeR::DGEList(counts = count_mat)
+
+  keep <- edgeR::filterByExpr(dge, group = sample_meta$Condition)
+  if (sum(keep) == 0) {
+    return(list(result = NULL, reason = "no_genes_after_filterByExpr"))
+  }
+
+  dge <- dge[keep, , keep.lib.sizes = FALSE]
+  dge <- edgeR::calcNormFactors(dge)
+
+  design <- stats::model.matrix(~ 0 + Condition, data = sample_meta)
+  colnames(design) <- gsub("Condition", "", colnames(design))
+
+  if (!all(cond_levels %in% colnames(design))) {
+    return(list(result = NULL, reason = "design_matrix_missing_condition"))
+  }
+
+  fit <- tryCatch({
+    dge <- edgeR::estimateDisp(dge, design)
+    edgeR::glmQLFit(dge, design)
+  }, error = function(e) {
+    return(structure(list(message = conditionMessage(e)), class = "pb_error"))
+  })
+
+  if (inherits(fit, "pb_error")) {
+    return(list(result = NULL, reason = paste0("edgeR_fit_failed: ", fit$message)))
+  }
+
+  contr <- limma::makeContrasts(TNFR2avsControl = TNFR2a - Control, levels = design)
+
+  qlf <- tryCatch({
+    edgeR::glmQLFTest(fit, contrast = contr[, "TNFR2avsControl"])
+  }, error = function(e) {
+    return(structure(list(message = conditionMessage(e)), class = "pb_error"))
+  })
+
+  if (inherits(qlf, "pb_error")) {
+    return(list(result = NULL, reason = paste0("glmQLFTest_failed: ", qlf$message)))
+  }
+
+  tt <- edgeR::topTags(qlf, n = Inf)$table
+  tt$gene <- rownames(tt)
+
+  list(result = tt, reason = NA_character_)
+}
+
+pb_de_list <- list()
+pb_diag_list <- list()
+
+for (cl in names(pb_by_cluster)) {
+  idx <- pb_by_cluster[[cl]]
+
+  mat_cl  <- pb[, idx, drop = FALSE]
+  meta_cl <- col_df[idx, , drop = FALSE]
+
+  out <- run_pb_edger(mat_cl, meta_cl, cond_levels = cond_levels)
+
+  pb_diag_list[[cl]] <- tibble::tibble(
+    cluster = cl,
+    n_profiles = nrow(meta_cl),
+    n_control = sum(meta_cl$Condition == "Control", na.rm = TRUE),
+    n_tnfr2a = sum(meta_cl$Condition == "TNFR2a", na.rm = TRUE),
+    status = if (is.null(out$result)) "skipped" else "ok",
+    reason = if (is.null(out$result)) out$reason else NA_character_
+  )
+
+  if (!is.null(out$result)) {
+    res <- out$result
+    res$cluster <- cl
+    pb_de_list[[cl]] <- res
+  }
+}
+
+pb_diag <- dplyr::bind_rows(pb_diag_list) %>%
+  dplyr::mutate(cluster = factor(cluster, levels = state_levels)) %>%
+  dplyr::arrange(cluster) %>%
+  dplyr::mutate(cluster = as.character(cluster))
+
+knitr::kable(
+  pb_diag,
+  caption = "Diagnostic summary of pseudobulk DE model fitting per refined state."
+)
+
+pb_de <- dplyr::bind_rows(pb_de_list)
+
+if (nrow(pb_de) == 0) {
+  pb_de <- tibble::tibble(
+    gene = character(),
+    logFC = numeric(),
+    logCPM = numeric(),
+    F = numeric(),
+    PValue = numeric(),
+    FDR = numeric(),
+    cluster = character()
+  )
+} else {
+  pb_de <- pb_de %>%
+    dplyr::mutate(
+      gene = as.character(gene),
+      cluster = as.character(cluster)
+    )
+}
+```
+
+```{r}
+#| label: pb-fdr-global-and-cluster
+#| message: false
+#| warning: false
+
+if (nrow(pb_de) == 0) {
+
+  pb_sig_summary <- pb_diag %>%
+    dplyr::transmute(
+      cluster = cluster,
+      n_tests = 0,
+      n_sig_global = 0,
+      n_sig_cluster = 0,
+      min_p = NA_real_,
+      status = status,
+      reason = reason
+    )
+
+  knitr::kable(
+    pb_sig_summary,
+    caption = "No valid pseudobulk DE results were obtained. See diagnostic reasons per refined state."
+  )
+
+} else {
+
+  pb_de <- pb_de %>%
+    dplyr::mutate(
+      FDR_global = p.adjust(PValue, method = "BH")
+    )
+
+  pb_de <- pb_de %>%
+    dplyr::group_by(cluster) %>%
+    dplyr::mutate(
+      FDR_cluster = p.adjust(PValue, method = "BH")
+    ) %>%
+    dplyr::ungroup()
+
+  pb_sig_summary <- pb_de %>%
+    dplyr::group_by(cluster) %>%
+    dplyr::summarise(
+      n_tests = dplyr::n(),
+      n_sig_global = sum(FDR_global < 0.05, na.rm = TRUE),
+      n_sig_cluster = sum(FDR_cluster < 0.05, na.rm = TRUE),
+      min_p = min(PValue, na.rm = TRUE),
+      .groups = "drop"
+    ) %>%
+    dplyr::mutate(cluster = factor(cluster, levels = state_levels)) %>%
+    dplyr::arrange(cluster) %>%
+    dplyr::mutate(cluster = as.character(cluster))
+
+  knitr::kable(
+    pb_sig_summary,
+    caption = "Summary of pseudobulk DE results per refined state under global and state-level FDR correction."
+  )
+}
+```
+
+```{r}
+#| label: tbl-pb-profile-size-and-recurring-genes
+#| message: false
+#| warning: false
+
+# (a) How many cells go into each pseudobulk profile?
+pb_profile_cells <- cell_md %>%
+  dplyr::count(cluster, Condition, sample) %>%
+  dplyr::group_by(cluster) %>%
+  dplyr::summarise(
+    min_cells_in_a_profile = min(n),
+    median_cells_per_profile = median(n),
+    .groups = "drop"
+  ) %>%
+  dplyr::arrange(factor(cluster, levels = state_levels))
+
+knitr::kable(pb_profile_cells,
+             caption = "Cells contributing to each pseudobulk profile, summarised per state.")
+
+# (b) Genes significant (state-level FDR < 0.05) in the same direction in several states
+recurring_genes <- pb_de %>%
+  dplyr::filter(FDR_cluster < 0.05) %>%
+  dplyr::mutate(direction = ifelse(logFC > 0, "Up_in_TNFR2a", "Up_in_Control")) %>%
+  dplyr::group_by(gene, direction) %>%
+  dplyr::summarise(
+    n_states = dplyr::n_distinct(cluster),
+    mean_logFC = round(mean(logFC), 2),
+    states = paste(sort(unique(cluster)), collapse = ", "),
+    .groups = "drop"
+  ) %>%
+  dplyr::arrange(dplyr::desc(n_states)) %>%
+  dplyr::slice_head(n = 25)
+
+knitr::kable(recurring_genes,
+             caption = "Pseudobulk DE genes shared across the largest number of states.")
+```
+
+```{r}
+#| label: pb-export-results
+#| message: false
+#| warning: false
+
+dir.create("output", showWarnings = FALSE, recursive = TRUE)
+
+readr::write_csv(pb_diag, "output/pseudobulk_DE_diagnostics_per_refined_state_TNFR2a_vs_Control.csv")
+readr::write_csv(pb_sig_summary, "output/pseudobulk_DE_summary_global_vs_clusterFDR_TNFR2a_vs_Control.csv")
+
+if (nrow(pb_de) > 0) {
+  readr::write_csv(pb_de, "output/pseudobulk_DE_edgeR_all_refined_states_TNFR2a_vs_Control.csv")
+}
+```
+
+## Pseudobulk differential expression: results summary
+
+To provide a conservative assessment of treatment-associated transcriptional changes, pseudobulk differential expression was first evaluated under global multiple-testing correction by applying the Benjamini–Hochberg procedure across all cluster-gene tests combined. Because each Leiden cluster represents a distinct transcriptional CD4 T-cell state and the biological question concerns treatment-dependent regulation within these states, multiple-testing correction was also applied independently within each cluster. This cluster-resolved approach maintains false discovery rate control per cluster while improving sensitivity for state-specific transcriptional changes that may be diluted under experiment-wide correction.
+
+```{r}
+#| label: pb-summary-table-html
+#| message: false
+#| warning: false
+
+if (nrow(pb_de) == 0) {
+
+  pb_summary_tbl <- pb_diag %>%
+    dplyr::transmute(
+      cluster = cluster,
+      Genes_tested = 0,
+      Min_PValue = NA_character_,
+      Min_FDR_global = NA_character_,
+      Min_FDR_cluster = NA_character_,
+      Sig_global_FDR_0_05 = 0,
+      Sig_cluster_FDR_0_05 = 0,
+      Med_abs_logFC = NA_real_,
+      Max_abs_logFC = NA_real_,
+      Status = status,
+      Reason = reason
+    )
+
+  knitr::kable(
+    pb_summary_tbl,
+    caption = "No refined states produced valid pseudobulk DE results. Diagnostic status is shown for each state.",
+    align = "c"
+  )
+
+} else {
+
+  pb_summary_tbl <- pb_de %>%
+    dplyr::group_by(cluster) %>%
+    dplyr::summarise(
+      Genes_tested = dplyr::n(),
+      Min_PValue = min(PValue, na.rm = TRUE),
+      Min_FDR_global = min(FDR_global, na.rm = TRUE),
+      Min_FDR_cluster = min(FDR_cluster, na.rm = TRUE),
+      Sig_global_FDR_0_05 = sum(FDR_global < 0.05, na.rm = TRUE),
+      Sig_cluster_FDR_0_05 = sum(FDR_cluster < 0.05, na.rm = TRUE),
+      Med_abs_logFC = median(abs(logFC), na.rm = TRUE),
+      Max_abs_logFC = max(abs(logFC), na.rm = TRUE),
+      .groups = "drop"
+    ) %>%
+    dplyr::mutate(cluster = factor(cluster, levels = state_levels)) %>%
+    dplyr::arrange(cluster) %>%
+    dplyr::mutate(
+      cluster = as.character(cluster),
+      Min_PValue = formatC(Min_PValue, format = "e", digits = 2),
+      Min_FDR_global = formatC(Min_FDR_global, format = "e", digits = 2),
+      Min_FDR_cluster = formatC(Min_FDR_cluster, format = "e", digits = 2),
+      Med_abs_logFC = round(Med_abs_logFC, 3),
+      Max_abs_logFC = round(Max_abs_logFC, 3)
+    )
+
+  knitr::kable(
+    pb_summary_tbl,
+    caption = "Pseudobulk differential expression summary per refined state (TNFR2a vs Control). Global FDR is calculated across all state-gene tests; state FDR is calculated within each refined state independently.",
+    align = "c"
+  )
+}
+```
+
+## Single-cell differential expression within clusters
+
+In addition to replicate-aware pseudobulk analysis, cluster-resolved single-cell differential expression was performed using Seurat's FindMarkers. This approach treats individual cells as independent observations and therefore increases sensitivity relative to replicate-level inference, but it does not account for sample-level correlation structure and may inflate significance. These results are included as a descriptive complement to the pseudobulk analysis.
+
+```{r}
+#| label: sc-de-prep-joinlayers-normalize
+#| message: false
+#| warning: false
+
+if ("RNA" %in% names(obj@assays)) {
+  DefaultAssay(obj) <- "RNA"
+}
+
+assay_name <- DefaultAssay(obj)
+assay_obj  <- obj[[assay_name]]
+
+if (inherits(assay_obj, "Assay5")) {
+  obj <- SeuratObject::JoinLayers(obj, assay = assay_name)
+}
+
+if (inherits(obj[[assay_name]], "Assay5")) {
+  lyr <- tryCatch(SeuratObject::Layers(obj[[assay_name]]), error = function(e) character(0))
+  if (!("data" %in% lyr)) {
+    obj <- Seurat::NormalizeData(obj, assay = assay_name)
+  }
+} else {
+  data_mat <- tryCatch(
+    SeuratObject::LayerData(obj, assay = assay_name, layer = "data"),
+    error = function(e) NULL
+  )
+  if (is.null(data_mat) || nrow(data_mat) == 0) {
+    obj <- Seurat::NormalizeData(obj, assay = assay_name)
+  }
+}
+```
+
+```{r}
+#| label: sc-de-within-cluster-all-cells
+#| message: false
+#| warning: false
+
+cluster_key <- "cluster_revised"
+group_col   <- "Condition"
+cond_levels <- c("Control", "TNFR2a")
+
+obj$Condition <- factor(as.character(obj$Condition), levels = cond_levels)
+obj$cluster_revised <- factor(as.character(obj$cluster_revised), levels = state_levels)
+
+if ("RNA" %in% names(obj@assays)) {
+  DefaultAssay(obj) <- "RNA"
+  if (inherits(obj[["RNA"]], "Assay5")) {
+    obj <- SeuratObject::JoinLayers(obj, assay = "RNA")
+  }
+}
+
+stopifnot(cluster_key %in% colnames(obj@meta.data))
+Idents(obj) <- cluster_key
+clusters_to_test <- levels(droplevels(Idents(obj)))
+
+pick_layer <- function(seu, assay) {
+  lyr <- tryCatch(SeuratObject::Layers(seu[[assay]]), error = function(e) character(0))
+  if ("data" %in% lyr) return("data")
+  if ("counts" %in% lyr) return("counts")
+  if (length(lyr) > 0) return(lyr[1])
+  return(NULL)
+}
+
+run_sc_de_cluster_allcells <- function(seu, cluster_id,
+                                       group_col = "Condition",
+                                       ident1 = "TNFR2a", ident2 = "Control",
+                                       test.use = "wilcox",
+                                       min.pct = 0.1, logfc.threshold = 0.0,
+                                       min_cells_per_group = 10) {
+
+  seu_cl <- subset(seu, idents = as.character(cluster_id))
+
+  grp <- seu_cl@meta.data[[group_col]]
+  n1 <- sum(grp == ident1, na.rm = TRUE)
+  n2 <- sum(grp == ident2, na.rm = TRUE)
+
+  if (n1 < min_cells_per_group || n2 < min_cells_per_group) {
+    return(tibble::tibble(
+      gene = character(0),
+      cluster = as.character(cluster_id),
+      n_ident1 = n1,
+      n_ident2 = n2
+    ))
+  }
+
+  assay <- DefaultAssay(seu_cl)
+  lyr <- pick_layer(seu_cl, assay)
+
+  res <- if (!is.null(lyr)) {
+    Seurat::FindMarkers(
+      seu_cl,
+      group.by = group_col,
+      ident.1 = ident1,
+      ident.2 = ident2,
+      test.use = test.use,
+      min.pct = min.pct,
+      logfc.threshold = logfc.threshold,
+      layer = lyr
+    )
+  } else {
+    Seurat::FindMarkers(
+      seu_cl,
+      group.by = group_col,
+      ident.1 = ident1,
+      ident.2 = ident2,
+      test.use = test.use,
+      min.pct = min.pct,
+      logfc.threshold = logfc.threshold,
+      slot = "data"
+    )
+  }
+
+  res %>%
+    tibble::rownames_to_column("gene") %>%
+    dplyr::mutate(
+      cluster = as.character(cluster_id),
+      n_ident1 = n1,
+      n_ident2 = n2
+    )
+}
+
+de_sc_all <- purrr::map_dfr(clusters_to_test, ~run_sc_de_cluster_allcells(obj, .x))
+
+readr::write_csv(de_sc_all, "output/singlecell_DE_within_refined_state_allcells_TNFR2a_vs_Control.csv")
+```
+
+```{r}
+#| label: sc-de-summary-table-html
+#| message: false
+#| warning: false
+
+fc_col <- dplyr::case_when(
+  "avg_log2FC" %in% colnames(de_sc_all) ~ "avg_log2FC",
+  "avg_logFC"  %in% colnames(de_sc_all) ~ "avg_logFC",
+  TRUE ~ NA_character_
+)
+
+stopifnot("p_val_adj" %in% colnames(de_sc_all))
+if (is.na(fc_col)) stop("No fold-change column found (expected avg_log2FC or avg_logFC).")
+
+sc_summary_tbl <- de_sc_all %>%
+  dplyr::mutate(
+    logFC = .data[[fc_col]],
+    sig = is.finite(p_val_adj) & (p_val_adj < 0.05),
+    cluster = factor(cluster, levels = state_levels)
+  ) %>%
+  dplyr::group_by(cluster) %>%
+  dplyr::summarise(
+    n_cells_TNFR2a = max(n_ident1, na.rm = TRUE),
+    n_cells_Control = max(n_ident2, na.rm = TRUE),
+    genes_tested = dplyr::n(),
+    sig_genes_FDR0_05 = sum(sig, na.rm = TRUE),
+    sig_up_in_TNFR2a = sum(sig & logFC > 0, na.rm = TRUE),
+    sig_up_in_Control = sum(sig & logFC < 0, na.rm = TRUE),
+    min_adj_p = min(p_val_adj, na.rm = TRUE),
+    .groups = "drop"
+  ) %>%
+  dplyr::arrange(cluster) %>%
+  dplyr::mutate(
+    cluster = as.character(cluster),
+    min_adj_p = formatC(min_adj_p, format = "e", digits = 2)
+  )
+
+knitr::kable(
+  sc_summary_tbl,
+  caption = "Single-cell differential expression within each refined state (all cells treated as independent). logFC is TNFR2a − Control. Significant genes are defined as Seurat-adjusted p_val_adj < 0.05.",
+  align = "c"
+)
+```
+
+```{r}
+#| label: sc-de-cluster-label-map
+#| message: false
+#| warning: false
+
+cluster_to_label <- state_labels_all
+
+stopifnot(setequal(names(cluster_to_label), state_levels))
+
+if (!is.null(annotation_col) && "cluster_revised" %in% colnames(obj@meta.data)) {
+  ann_map <- obj@meta.data %>%
+    dplyr::distinct(cluster_revised, .data[[annotation_col]]) %>%
+    dplyr::filter(!is.na(.data[[annotation_col]])) %>%
+    dplyr::mutate(cluster_revised = as.character(cluster_revised))
+
+  if (nrow(ann_map) > 0) {
+    cluster_to_label <- stats::setNames(
+      ann_map[[annotation_col]],
+      ann_map$cluster_revised
+    )
+  }
+}
+
+get_cluster_title <- function(cluster_id) {
+  k <- as.character(cluster_id)
+  lab <- unname(cluster_to_label[k])
+  if (is.na(lab) || lab == "") k else lab
+}
+```
+
+## Volcano plots per cluster (single cell DE)
+
+Predicted genes (Gm and Rik identifiers) are shown as points but are not labelled.
+Points are coloured at adjusted p < 0.05.
+
+```{r}
+#| label: sc-de-volcano-per-cluster
+#| message: false
+#| warning: false
+#| fig-width: 11
+#| fig-height: 7
+#| fig-dpi: 300
+
+padj_cutoff <- 0.05
+label_exclude <- "^Gm[0-9]|Rik$"   # not labelled on the plot; still tested and plotted as points
+top_n_label <- 10
+
+fc_col <- dplyr::case_when(
+  "avg_log2FC" %in% colnames(de_sc_all) ~ "avg_log2FC",
+  "avg_logFC"  %in% colnames(de_sc_all) ~ "avg_logFC",
+  TRUE ~ NA_character_
+)
+if (is.na(fc_col)) stop("No FC column found in de_sc_all (expected avg_log2FC or avg_logFC).")
+
+clusters <- sort(unique(as.character(de_sc_all$cluster)))
+
+for (cl in clusters) {
+
+  df_cl <- de_sc_all %>%
+    dplyr::filter(as.character(cluster) == as.character(cl)) %>%
+    dplyr::mutate(
+      logFC = .data[[fc_col]],
+      neglog10padj = -log10(pmax(p_val_adj, 1e-300)),
+      direction = dplyr::case_when(
+        is.finite(p_val_adj) & p_val_adj < padj_cutoff & logFC > 0 ~ "Up in TNFR2a",
+        is.finite(p_val_adj) & p_val_adj < padj_cutoff & logFC < 0 ~ "Up in Control",
+        TRUE ~ "NS"
+      )
+    )
+
+  if (nrow(df_cl) == 0) next
+
+  lab_up <- df_cl %>%
+    dplyr::filter(p_val_adj < padj_cutoff, logFC > 0, !grepl(label_exclude, gene)) %>%
+    dplyr::arrange(dplyr::desc(logFC)) %>%
+    dplyr::slice_head(n = top_n_label)
+
+  lab_dn <- df_cl %>%
+    dplyr::filter(p_val_adj < padj_cutoff, logFC < 0, !grepl(label_exclude, gene)) %>%
+    dplyr::arrange(logFC) %>%
+    dplyr::slice_head(n = top_n_label)
+
+  lab_df <- dplyr::bind_rows(lab_up, lab_dn)
+
+  p <- ggplot2::ggplot(df_cl, ggplot2::aes(x = logFC, y = neglog10padj)) +
+    ggplot2::geom_point(ggplot2::aes(color = direction), alpha = 0.65, size = 1.2) +
+    ggplot2::geom_vline(xintercept = 0, linewidth = 0.3) +
+    ggplot2::geom_hline(yintercept = -log10(padj_cutoff), linetype = "dashed", linewidth = 0.3) +
+    ggrepel::geom_text_repel(
+      data = lab_df,
+      ggplot2::aes(label = gene),
+      size = 3,
+      max.overlaps = Inf,
+      min.segment.length = 0
+    ) +
+    ggplot2::theme_classic(base_size = 13) +
+    ggplot2::theme(legend.position = "bottom") +
+    ggplot2::labs(
+      title = paste0(get_cluster_title(cl), " — Single-cell DE (TNFR2a vs Control)"),
+      x = "log2 fold-change (TNFR2a − Control)",
+      y = "-log10(adj. p-value)"
+    )
+
+  print(p)
+}
+```
+
+### Diagnostics for the shared signature
+
+Genes that change in the same direction in many states can reflect a real systemic effect, a shift in state composition, or a technical batch difference that coincides with treatment. The shared signature is defined from the data as genes significant (FDR < 0.05) in the same direction in at least six states. Its per-mouse consistency, its relationship to QC metrics, and the effect of removing it on the state-level results are checked below.
+
+```{r}
+#| label: define-shared-signature
+
+min_states_shared <- 6
+
+shared_signature <- pb_de %>%
+  dplyr::filter(FDR_cluster < 0.05) %>%
+  dplyr::mutate(dir = ifelse(logFC > 0, "up", "down")) %>%
+  dplyr::group_by(gene, dir) %>%
+  dplyr::summarise(n_states = dplyr::n_distinct(cluster), .groups = "drop") %>%
+  dplyr::filter(n_states >= min_states_shared) %>%
+  dplyr::arrange(dplyr::desc(n_states))
+
+shared_up <- shared_signature$gene[shared_signature$dir == "up"]
+shared_down <- shared_signature$gene[shared_signature$dir == "down"]
+
+knitr::kable(shared_signature, caption = "Shared signature: genes significant in the same direction in at least six refined states.")
+```
+
+```{r}
+#| label: tbl-recurring-genes-per-mouse
+#| message: false
+#| warning: false
+#| results: asis
+
+genes_check <- c(head(shared_up, 6), head(shared_down, 6), "Cd3e", "Actb")
+genes_check <- intersect(genes_check, rownames(pb))
+
+cpm_pb <- edgeR::cpm(pb, log = FALSE)
+
+for (st in c("Naive_like", "Treg_tissue_like")) {
+  cols <- col_df$pb_key[col_df$cluster == st]
+  sub  <- round(cpm_pb[genes_check, cols, drop = FALSE], 1)
+  colnames(sub) <- sub("^.*___", "", colnames(sub))
+  sub <- sub[, intersect(sample_levels, colnames(sub))]
+  print(knitr::kable(sub, caption = paste0("CPM per mouse in ", st, ".")))
+}
+```
+
+```{r}
+#| label: tbl-signature-vs-qc
+#| message: false
+#| warning: false
+
+sig_up <- intersect(shared_up, rownames(obj))
+qc_vars <- intersect(c("percent.mt", "nFeature_RNA", "nCount_RNA"),
+                     colnames(obj@meta.data))
+
+dat <- Seurat::FetchData(
+  obj,
+  vars = c(sig_up, "orig.ident", "Condition", "cluster_revised", qc_vars),
+  layer = "data"
+)
+dat$sig_score <- rowMeans(dat[, sig_up, drop = FALSE])
+
+dat_naive <- dat[dat$cluster_revised == "Naive_like", ]
+
+by_mouse <- dat_naive %>%
+  dplyr::group_by(orig.ident, Condition) %>%
+  dplyr::summarise(
+    n = dplyr::n(),
+    median_percent_mt  = round(median(percent.mt), 2),
+    median_nFeature    = round(median(nFeature_RNA)),
+    median_nCount      = round(median(nCount_RNA)),
+    median_sig_score   = round(median(sig_score), 3),
+    cor_sig_vs_percent_mt = round(cor(sig_score, percent.mt, method = "spearman"), 2),
+    cor_sig_vs_nFeature   = round(cor(sig_score, nFeature_RNA, method = "spearman"), 2),
+    .groups = "drop"
+  )
+
+knitr::kable(by_mouse,
+  caption = "Naive_like cells: TNFR2a-associated signature score vs QC metrics, per mouse.")
+```
+
+```{r}
+#| label: tbl-signature-uniformity
+#| message: false
+#| warning: false
+
+veh_q95 <- dat %>%
+  dplyr::filter(Condition == "Control") %>%
+  dplyr::group_by(cluster_revised) %>%
+  dplyr::summarise(q95 = quantile(sig_score, 0.95), .groups = "drop")
+
+uniformity <- dat %>%
+  dplyr::left_join(veh_q95, by = "cluster_revised") %>%
+  dplyr::group_by(cluster_revised, orig.ident) %>%
+  dplyr::summarise(pct_above_control_q95 = round(100 * mean(sig_score > q95), 1),
+                   .groups = "drop") %>%
+  tidyr::pivot_wider(names_from = orig.ident, values_from = pct_above_control_q95)
+
+knitr::kable(uniformity,
+  caption = "% of cells per mouse with a signature score above the 95th percentile of Control cells in the same state.")
+```
+
+```{r}
+#| label: tbl-pb-sensitivity-without-shared-genes
+#| message: false
+#| warning: false
+
+shared_dir <- pb_de %>%
+  dplyr::filter(FDR_cluster < 0.05) %>%
+  dplyr::mutate(dir = sign(logFC)) %>%
+  dplyr::group_by(gene, dir) %>%
+  dplyr::summarise(n_states = dplyr::n_distinct(cluster), .groups = "drop") %>%
+  dplyr::filter(n_states >= min_states_shared)
+
+shared_genes <- union(shared_dir$gene, grep("^mt-", rownames(pb), value = TRUE))
+
+pb_sens_list <- lapply(names(pb_by_cluster), function(cl) {
+  idx <- pb_by_cluster[[cl]]
+  out <- run_pb_edger(pb[!rownames(pb) %in% shared_genes, idx, drop = FALSE],
+                      col_df[idx, , drop = FALSE], cond_levels = cond_levels)
+  if (is.null(out$result)) return(NULL)
+  out$result$cluster <- cl
+  out$result
+})
+
+pb_sens <- dplyr::bind_rows(pb_sens_list) %>%
+  dplyr::group_by(cluster) %>%
+  dplyr::mutate(FDR_cluster = p.adjust(PValue, method = "BH")) %>%
+  dplyr::ungroup()
+
+sens_compare <- pb_sens %>%
+  dplyr::group_by(cluster) %>%
+  dplyr::summarise(n_sig_without_shared = sum(FDR_cluster < 0.05), .groups = "drop") %>%
+  dplyr::left_join(
+    pb_sig_summary %>% dplyr::select(cluster, n_sig_original = n_sig_cluster),
+    by = "cluster"
+  ) %>%
+  dplyr::arrange(factor(cluster, levels = state_levels))
+
+readr::write_csv(pb_sens, "output/pseudobulk_DE_sensitivity_without_shared_genes.csv")
+
+cat("Genes removed (shared across >=", min_states_shared, "states, plus any mt- genes):", length(shared_genes), "\n")
+knitr::kable(sens_compare,
+  caption = "Significant pseudobulk DE genes per state: original vs after removing shared-signature and mt- genes.")
+```
+
+```{r}
+#| label: tbl-pb-sensitivity-logfc-correlation
+#| message: false
+#| warning: false
+
+big_states <- c("Naive_like", "Activated_memory_like", "Th1_cytotoxic_like",
+                "Treg_resting_like", "Treg_tissue_like", "IFN_response", "Cycling")
+
+lfc_wide <- pb_sens %>%
+  dplyr::filter(cluster %in% big_states) %>%
+  dplyr::select(gene, cluster, logFC) %>%
+  tidyr::pivot_wider(names_from = cluster, values_from = logFC)
+
+cor_mat <- cor(lfc_wide[, big_states], use = "pairwise.complete.obs", method = "spearman")
+
+knitr::kable(round(cor_mat, 2),
+  caption = "Spearman correlation of TNFR2a vs Control logFC between states, after removing shared-signature and mt- genes.")
+
+# Direction of the remaining significant genes, per state
+dir_tab <- pb_sens %>%
+  dplyr::filter(FDR_cluster < 0.05) %>%
+  dplyr::group_by(cluster) %>%
+  dplyr::summarise(
+    sig_up_in_TNFR2a = sum(logFC > 0),
+    sig_up_in_Control = sum(logFC < 0),
+    .groups = "drop"
+  ) %>%
+  dplyr::arrange(factor(cluster, levels = state_levels))
+
+knitr::kable(dir_tab,
+  caption = "Direction of the remaining significant genes per state.")
+```
+
+```{r}
+#| label: tbl-pb-state-restricted-genes
+#| message: false
+#| warning: false
+
+sens_sig <- pb_sens %>%
+  dplyr::filter(FDR_cluster < 0.05) %>%
+  dplyr::mutate(dir = sign(logFC)) %>%
+  dplyr::group_by(gene, dir) %>%
+  dplyr::mutate(n_states_sig = dplyr::n_distinct(cluster)) %>%
+  dplyr::ungroup()
+
+state_restricted <- sens_sig %>% dplyr::filter(n_states_sig <= 2)
+
+restricted_counts <- sens_sig %>%
+  dplyr::group_by(cluster) %>%
+  dplyr::summarise(
+    n_sig_after_removal = dplyr::n(),
+    n_state_restricted = sum(n_states_sig <= 2),
+    .groups = "drop"
+  ) %>%
+  dplyr::arrange(factor(cluster, levels = state_levels))
+
+knitr::kable(restricted_counts,
+  caption = "Significant genes after removal of shared genes, and how many are significant in at most 2 states.")
+
+readr::write_csv(state_restricted, "output/pseudobulk_DE_state_restricted_genes.csv")
+
+top_restricted <- state_restricted %>%
+  dplyr::filter(cluster %in% c("Naive_like", "Activated_memory_like", "Th1_cytotoxic_like",
+                               "Treg_resting_like", "Treg_tissue_like"),
+                !grepl("^Gm[0-9]|Rik$", gene)) %>%
+  dplyr::group_by(cluster) %>%
+  dplyr::arrange(FDR_cluster, .by_group = TRUE) %>%
+  dplyr::slice_head(n = 10) %>%
+  dplyr::ungroup() %>%
+  dplyr::mutate(direction = ifelse(logFC > 0, "Up_in_TNFR2a", "Up_in_Control"),
+                logFC = round(logFC, 2),
+                FDR_cluster = signif(FDR_cluster, 2)) %>%
+  dplyr::select(cluster, gene, direction, logFC, FDR_cluster, n_states_sig)
+
+knitr::kable(top_restricted,
+  caption = "Top state-restricted pseudobulk genes per state, ranked by significance (Gm/Rik names not shown).")
+```
+
+```{r}
+#| label: tbl-ieg-and-proliferation-per-mouse
+#| message: false
+#| warning: false
+
+ieg_genes  <- intersect(c("Fos", "Egr1", "Jun", "Junb", "Fosb", "Nr4a1", "Nr4a2",
+                          "Cd69", "Ier2", "Csrnp1", "Dusp1"), rownames(obj))
+prolif_genes <- intersect(c("Birc5", "Ccna2", "Ccnb2", "Mki67", "Top2a", "Stmn1"),
+                          rownames(obj))
+
+sc <- Seurat::FetchData(obj, vars = c(ieg_genes, prolif_genes,
+                                      "orig.ident", "cluster_revised"), layer = "data")
+sc$ieg_score    <- rowMeans(sc[, ieg_genes, drop = FALSE])
+sc$prolif_score <- rowMeans(sc[, prolif_genes, drop = FALSE])
+
+score_tab <- function(col) {
+  sc %>%
+    dplyr::group_by(cluster_revised, orig.ident) %>%
+    dplyr::summarise(v = round(mean(.data[[col]]), 3), .groups = "drop") %>%
+    tidyr::pivot_wider(names_from = orig.ident, values_from = v) %>%
+    dplyr::select(cluster_revised, dplyr::any_of(sample_levels))
+}
+
+knitr::kable(score_tab("ieg_score"),
+  caption = "Mean immediate-early gene score per mouse and state.")
+knitr::kable(score_tab("prolif_score"),
+  caption = "Mean proliferation gene score per mouse and state.")
+```
+
+```{r}
+#| label: sc-de-top20-export-csv-from-de_sc_all
+#| message: false
+#| warning: false
+
+padj_cutoff <- 0.05
+top_n <- 20
+
+fc_col <- dplyr::case_when(
+  "avg_log2FC" %in% colnames(de_sc_all) ~ "avg_log2FC",
+  "avg_logFC"  %in% colnames(de_sc_all) ~ "avg_logFC",
+  TRUE ~ NA_character_
+)
+
+stopifnot(!is.na(fc_col))
+stopifnot("p_val_adj" %in% colnames(de_sc_all))
+stopifnot("gene" %in% colnames(de_sc_all))
+stopifnot("cluster" %in% colnames(de_sc_all))
+
+deg_sig <- de_sc_all %>%
+  dplyr::mutate(
+    cluster = as.character(cluster),
+    gene = as.character(gene),
+    logFC = .data[[fc_col]]
+  ) %>%
+  dplyr::filter(
+    is.finite(p_val_adj),
+    p_val_adj < padj_cutoff,
+    is.finite(logFC),
+    !is.na(gene),
+    gene != ""
+  )
+
+clusters <- state_levels[state_levels %in% unique(deg_sig$cluster)]
+
+top_list <- lapply(clusters, function(cl) {
+
+  df_cl <- deg_sig %>% dplyr::filter(cluster == cl)
+  if (nrow(df_cl) == 0) return(NULL)
+
+  up <- df_cl %>%
+    dplyr::filter(logFC > 0) %>%
+    dplyr::arrange(dplyr::desc(logFC)) %>%
+    dplyr::slice_head(n = top_n) %>%
+    dplyr::mutate(direction = "Up_in_TNFR2a", rank = dplyr::row_number())
+
+  down <- df_cl %>%
+    dplyr::filter(logFC < 0) %>%
+    dplyr::arrange(logFC) %>%
+    dplyr::slice_head(n = top_n) %>%
+    dplyr::mutate(direction = "Up_in_Control", rank = dplyr::row_number())
+
+  dplyr::bind_rows(up, down) %>%
+    dplyr::mutate(
+      cluster_annotation = unname(cluster_to_label[cluster])
+    ) %>%
+    dplyr::select(
+      cluster,
+      cluster_annotation,
+      direction,
+      rank,
+      gene,
+      logFC,
+      p_val_adj
+    )
+})
+
+top20_sc_df <- dplyr::bind_rows(top_list) %>%
+  dplyr::mutate(cluster = factor(cluster, levels = state_levels)) %>%
+  dplyr::arrange(cluster, direction, rank) %>%
+  dplyr::mutate(cluster = as.character(cluster))
+
+readr::write_csv(top20_sc_df, "output/singlecell_top20_up_down_per_refined_state_TNFR2a_vs_Control.csv")
+
+knitr::kable(
+  head(top20_sc_df, 20),
+  caption = "Preview of the top significant single-cell DE genes per refined state."
+)
+```
+
+### Optional volcano plots per cluster (pseudobulk)
+
+```{r}
+#| label: pb-volcano-per-cluster
+#| message: false
+#| warning: false
+#| eval: false
+#| fig-width: 12
+#| fig-height: 8
+#| fig-dpi: 300
+
+plot_pb_volcano <- function(pb_de, cluster_id, fdr_cutoff = 0.05, top_n = 10) {
+
+  df <- pb_de %>%
+    dplyr::filter(cluster == cluster_id) %>%
+    dplyr::mutate(
+      neglog10FDR = -log10(pmax(FDR_cluster, 1e-300)),
+      direction = dplyr::case_when(
+        FDR_cluster < fdr_cutoff & logFC > 0 ~ "Up in TNFR2a",
+        FDR_cluster < fdr_cutoff & logFC < 0 ~ "Up in Control",
+        TRUE ~ "NS"
+      )
+    )
+
+  lab_up <- df %>%
+    dplyr::filter(FDR_cluster < fdr_cutoff, logFC > 0) %>%
+    dplyr::arrange(dplyr::desc(logFC)) %>%
+    dplyr::slice_head(n = top_n)
+
+  lab_dn <- df %>%
+    dplyr::filter(FDR_cluster < fdr_cutoff, logFC < 0) %>%
+    dplyr::arrange(logFC) %>%
+    dplyr::slice_head(n = top_n)
+
+  lab_df <- dplyr::bind_rows(lab_up, lab_dn)
+
+  ggplot2::ggplot(df, ggplot2::aes(x = logFC, y = neglog10FDR)) +
+    ggplot2::geom_point(ggplot2::aes(color = direction), alpha = 0.65, size = 1.2) +
+    ggplot2::geom_vline(xintercept = 0, linewidth = 0.3) +
+    ggplot2::geom_hline(yintercept = -log10(fdr_cutoff), linetype = "dashed", linewidth = 0.3) +
+    ggrepel::geom_text_repel(
+      data = lab_df,
+      ggplot2::aes(label = gene),
+      size = 3.0,
+      max.overlaps = Inf,
+      min.segment.length = 0
+    ) +
+    ggplot2::theme_classic(base_size = 13) +
+    ggplot2::theme(legend.position = "bottom") +
+    ggplot2::labs(
+      title = paste0("Cluster ", cluster_id, " — Pseudobulk DE (TNFR2a vs Control)"),
+      x = "log2 fold-change (TNFR2a − Control)",
+      y = "-log10(FDR_cluster)"
+    )
+}
+
+clusters <- sort(unique(pb_de$cluster))
+for (cl in clusters) {
+  print(plot_pb_volcano(pb_de, cl))
+}
+```
+
+## Extra figures for publication
+
+```{r}
+#| label: fig-da-forest-refined-states
+#| message: false
+#| warning: false
+#| fig-cap: "Differential abundance of refined CD4 T-cell states in TNFR2a versus Control. Points show log2 fold-change in mouse-level state proportions; horizontal lines show approximate 95% confidence intervals. Positive values indicate enrichment in TNFR2a, whereas negative values indicate enrichment in Control."
+#| fig-width: 8.5
+#| fig-height: 6.2
+#| fig-dpi: 300
+
+dir.create("figures", showWarnings = FALSE, recursive = TRUE)
+dir.create("output", showWarnings = FALSE, recursive = TRUE)
+
+cluster_to_label <- state_labels_all
+
+stopifnot(setequal(names(cluster_to_label), state_levels))
+
+da_sample_props <- obj@meta.data %>%
+  dplyr::filter(
+    !is.na(cluster_revised),
+    !is.na(orig.ident),
+    !is.na(Condition)
+  ) %>%
+  dplyr::mutate(
+    cluster_revised = factor(as.character(cluster_revised), levels = state_levels),
+    Condition = factor(as.character(Condition), levels = c("Control", "TNFR2a"))
+  ) %>%
+  dplyr::count(orig.ident, Condition, cluster_revised, name = "n_state") %>%
+  dplyr::group_by(orig.ident, Condition) %>%
+  tidyr::complete(
+    cluster_revised = factor(state_levels, levels = state_levels),
+    fill = list(n_state = 0)
+  ) %>%
+  dplyr::mutate(
+    n_total = sum(n_state),
+    prop = n_state / n_total
+  ) %>%
+  dplyr::ungroup()
+
+da_results <- da_sample_props %>%
+  dplyr::group_by(cluster_revised) %>%
+  dplyr::group_modify(~{
+    df <- .x
+
+    control <- df$prop[df$Condition == "Control"]
+    tnfr2a <- df$prop[df$Condition == "TNFR2a"]
+
+    eps <- 0.5 / max(df$n_total, na.rm = TRUE)
+
+    log_prop <- log2(df$prop + eps)
+
+    fit <- stats::lm(log_prop ~ Condition, data = df)
+    smry <- summary(fit)$coefficients
+
+    term <- "ConditionTNFR2a"
+
+    tibble::tibble(
+      mean_prop_control = mean(control, na.rm = TRUE),
+      mean_prop_tnfr2a = mean(tnfr2a, na.rm = TRUE),
+      log2FC_TNFR2a_vs_Control = unname(stats::coef(fit)[term]),
+      se = smry[term, "Std. Error"],
+      p_value = smry[term, "Pr(>|t|)"]
+    )
+  }) %>%
+  dplyr::ungroup() %>%
+  dplyr::mutate(
+    FDR = p.adjust(p_value, method = "BH"),
+    ci_low = log2FC_TNFR2a_vs_Control - 1.96 * se,
+    ci_high = log2FC_TNFR2a_vs_Control + 1.96 * se,
+    cluster_label = dplyr::recode(
+      as.character(cluster_revised),
+      !!!cluster_to_label,
+      .default = as.character(cluster_revised)
+    ),
+    direction = dplyr::case_when(
+      FDR < 0.05 & log2FC_TNFR2a_vs_Control > 0 ~ "Enriched in TNFR2a",
+      FDR < 0.05 & log2FC_TNFR2a_vs_Control < 0 ~ "Enriched in Control",
+      TRUE ~ "Not significant"
+    ),
+    cluster_label = factor(
+      cluster_label,
+      levels = rev(unname(cluster_to_label[state_levels]))
+    )
+  )
+
+readr::write_csv(
+  da_sample_props,
+  "output/differential_abundance_mouse_level_state_proportions.csv"
+)
+
+readr::write_csv(
+  da_results,
+  "output/differential_abundance_refined_states_TNFR2a_vs_Control.csv"
+)
+
+p_da_forest <- ggplot2::ggplot(
+  da_results,
+  ggplot2::aes(
+    x = log2FC_TNFR2a_vs_Control,
+    y = cluster_label,
+    color = direction
+  )
+) +
+  ggplot2::geom_vline(xintercept = 0, linewidth = 0.4, linetype = "dashed") +
+  ggplot2::geom_errorbarh(
+    ggplot2::aes(xmin = ci_low, xmax = ci_high),
+    height = 0,
+    linewidth = 0.6
+  ) +
+  ggplot2::geom_point(size = 3) +
+  ggplot2::scale_color_manual(
+    values = c(
+      "Enriched in TNFR2a" = "#B2182B",
+      "Enriched in Control" = "#2166AC",
+      "Not significant" = "grey55"
+    )
+  ) +
+  ggplot2::theme_classic(base_size = 13) +
+  ggplot2::theme(
+    legend.position = "bottom",
+    axis.title.y = ggplot2::element_blank()
+  ) +
+  ggplot2::labs(
+    x = "log2 fold-change in abundance proportion (TNFR2a / Control)",
+    color = NULL
+  )
+
+print(p_da_forest)
+
+ggplot2::ggsave(
+  filename = "figures/Figure2D_differential_abundance_forest_refined_states.png",
+  plot = p_da_forest,
+  width = 8.5,
+  height = 6.2,
+  dpi = 300
+)
+
+knitr::kable(
+  da_results %>%
+    dplyr::mutate(
+      mean_prop_control = round(mean_prop_control, 4),
+      mean_prop_tnfr2a = round(mean_prop_tnfr2a, 4),
+      log2FC_TNFR2a_vs_Control = round(log2FC_TNFR2a_vs_Control, 3),
+      ci_low = round(ci_low, 3),
+      ci_high = round(ci_high, 3),
+      p_value = formatC(p_value, format = "e", digits = 2),
+      FDR = formatC(FDR, format = "e", digits = 2)
+    ) %>%
+    dplyr::select(
+      cluster_revised,
+      mean_prop_control,
+      mean_prop_tnfr2a,
+      log2FC_TNFR2a_vs_Control,
+      ci_low,
+      ci_high,
+      p_value,
+      FDR
+    ),
+  caption = "Mouse-level differential abundance summary for refined CD4 T-cell states."
+)
+```
+
+## Interpretation
+
+Pseudobulk differential expression, with each mouse as the unit of replication [@squair2021pseudobulk; @chen2016edger], identifies treatment-associated changes in most refined states. The small Th2/tissue-like and IL-17-like states have too few cells per mouse for well-powered tests and yield no significant genes.
+
+Mouse-level state proportions confirm the composition shift described in the refinement chapter. Treg tissue-like and cycling cells increase, and naive-like cells decrease, each at FDR < 0.001. IFN-response cells show a weaker decrease that does not reach FDR < 0.05.
+
+The within-state gene signals are best read alongside that shift. Higher *Foxp3*, *Ikzf2*, *Ccr8* and *Tnfrsf9* in non-Treg states most likely reflects more Treg-like cells within broadly defined states. Lower *Bach2*, *Satb1* and *Klf2* across states points to reduced quiescence. Within the tissue Treg state itself, TNFR2a pushes cells further along an activated, effector program.
+
+Single-cell Wilcoxon tests detect many more genes, because they treat cells as independent replicates. They are shown as a descriptive complement, and inference rests on the pseudobulk models.
+
+### Key findings
+
+- TNFR2a expands Treg tissue-like and cycling cells and reduces the naive-like fraction at mouse level (FDR < 0.001 each).
+- A Treg/activation signature (*Ikzf2*, *Foxp3*, *Ccr8*, *Tnfrsf9*) rises within several non-Treg states, most likely reflecting greater Treg admixture.
+- Quiescence factors (*Bach2*, *Satb1*, *Klf2*, *Foxp1*) are lower under TNFR2a across states.
+- Within tissue Tregs, TNFR2a enhances an effector program (*Il1r2*, *Bhlhe40*, *Traf2*, *Tnfrsf1b*).
+- Immediate-early gene differences are treated as possible dissociation artefacts. `Unresolved_state` is not interpreted.
+
+## Summary
+
+This chapter compared TNFR2a and control mice within each refined CD4⁺ T-cell state using pseudobulk edgeR quasi-likelihood models, with single-cell tests as a descriptive complement. TNFR2 agonism produces a coherent signal: more tissue and proliferating Tregs, a Treg/activation signature spreading into broadly defined states, reduced expression of quiescence factors, and a more effector-like tissue Treg program. The next chapter asks how these effects relate to clonal expansion.

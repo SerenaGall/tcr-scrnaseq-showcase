@@ -1,0 +1,802 @@
+---
+title: "Clonotype-informed differential expression analysis"
+execute:
+  echo: true
+  message: false
+  warning: false
+
+---
+
+```{r}
+#| label: setup
+#| message: false
+#| warning: false
+
+source("R/setup.R")
+source("R/helpers.R")
+```
+
+## Overview
+
+This chapter integrates reconstructed TCR clonotype information with differential expression analysis to determine whether TNFR2a alters transcriptional programs within clonally expanded CD4 T cells.
+
+Three complementary analyses were performed. First, differential expression between TNFR2a and Control was evaluated within condition-specific expanded clonotypes to test whether treatment alters transcriptional states within the expanded T-cell compartment. Second, this comparison was to be repeated specifically within expanded Treg_tissue_like cells, subject to a minimum number of contributing mice per condition.
+
+Together, these analyses assess how far treatment-associated differences, clonal expansion and the state composition of expanded cells can be separated in this dataset.
+
+```{r}
+#| label: load-objects
+#| message: false
+#| warning: false
+
+df <- readRDS("data/TCRseq_revised_clustering.rds")
+vdj_contigs_list <- readRDS("data/vdj_contigs_list.rds")
+
+stopifnot("cluster_revised" %in% colnames(df@meta.data))
+Idents(df) <- "cluster_revised"
+
+state_levels <- state_levels_all
+
+# Fail loudly if the labels in the object and this list ever disagree,
+# so that cells are never silently turned into NA by factor().
+stopifnot(setequal(state_levels, unique(as.character(df$cluster_revised))))
+
+df$cluster_revised <- factor(df$cluster_revised, levels = state_levels)
+
+if (!"Condition" %in% colnames(df@meta.data)) {
+  df$Condition <- dplyr::case_when(
+    grepl("^TNFR2a_", df$orig.ident) ~ "TNFR2a",
+    grepl("^Ctrl_", df$orig.ident) ~ "Control",
+    TRUE ~ NA_character_
+  )
+}
+```
+
+## Define reconstructed clonotypes
+
+Productive TRA and TRB contigs are filtered and collapsed to barcode-level receptor summaries. Clonotypes are defined using chain-aware CDR3 amino-acid sequences, allowing paired TRA/TRB clonotypes, TRB-only clonotypes, and TRA-only clonotypes to be retained.
+
+```{r}
+#| label: reconstruct-clonotypes
+#| message: false
+#| warning: false
+
+vdj_contigs <- dplyr::bind_rows(vdj_contigs_list, .id = "sample_list_name")
+
+if ("sample" %in% colnames(vdj_contigs)) {
+  vdj_contigs <- vdj_contigs %>%
+    dplyr::mutate(sample = ifelse(is.na(sample) | sample == "", sample_list_name, sample))
+} else {
+  vdj_contigs <- vdj_contigs %>%
+    dplyr::mutate(sample = sample_list_name)
+}
+
+if ("productive" %in% colnames(vdj_contigs)) {
+  vdj_contigs <- vdj_contigs %>%
+    dplyr::filter(productive %in% TRUE)
+}
+
+if ("chain" %in% colnames(vdj_contigs)) {
+  vdj_contigs <- vdj_contigs %>%
+    dplyr::filter(chain %in% c("TRA", "TRB"))
+}
+
+required_cols <- c("barcode", "cdr3", "sample")
+missing_required <- setdiff(required_cols, colnames(vdj_contigs))
+
+if (length(missing_required) > 0) {
+  stop(
+    paste(
+      "VDJ contig table is missing required columns:",
+      paste(missing_required, collapse = ", ")
+    )
+  )
+}
+
+# sample_suffix_map is defined in R/setup.R (sample -> barcode suffix)
+
+vdj_contigs <- vdj_contigs %>%
+  dplyr::left_join(sample_suffix_map, by = "sample") %>%
+  dplyr::mutate(
+    barcode_raw = barcode,
+    barcode_base = sub("(_\\d+)$", "", barcode),
+    barcode = paste0(barcode_base, suffix)
+  ) %>%
+  dplyr::select(-barcode_base)
+
+if (any(is.na(vdj_contigs$suffix))) {
+  stop("Some VDJ samples were not found in sample_suffix_map.")
+}
+
+has_umis <- "umis" %in% colnames(vdj_contigs)
+has_reads <- "reads" %in% colnames(vdj_contigs)
+
+primary_contigs <- vdj_contigs %>%
+  dplyr::mutate(
+    umis_rank = if (has_umis) umis else NA_real_,
+    reads_rank = if (has_reads) reads else NA_real_
+  ) %>%
+  dplyr::group_by(sample, barcode, chain) %>%
+  dplyr::arrange(dplyr::desc(umis_rank), dplyr::desc(reads_rank), .by_group = TRUE) %>%
+  dplyr::mutate(chain_rank = dplyr::row_number()) %>%
+  dplyr::ungroup() %>%
+  dplyr::filter(chain_rank == 1)
+
+barcode_tcr_summary <- primary_contigs %>%
+  dplyr::group_by(sample, barcode) %>%
+  dplyr::summarise(
+    TRA_cdr3_aa = {
+      x <- cdr3[chain == "TRA"]
+      if (length(x) == 0) NA_character_ else paste(x, collapse = ";")
+    },
+    TRB_cdr3_aa = {
+      x <- cdr3[chain == "TRB"]
+      if (length(x) == 0) NA_character_ else paste(x, collapse = ";")
+    },
+    has_TRA = any(chain == "TRA"),
+    has_TRB = any(chain == "TRB"),
+    .groups = "drop"
+  ) %>%
+  dplyr::mutate(
+    clone_id_paired = dplyr::case_when(
+      !is.na(TRA_cdr3_aa) & !is.na(TRB_cdr3_aa) ~ paste(TRA_cdr3_aa, TRB_cdr3_aa, sep = " | "),
+      !is.na(TRB_cdr3_aa) ~ paste("TRB_only", TRB_cdr3_aa, sep = " | "),
+      !is.na(TRA_cdr3_aa) ~ paste("TRA_only", TRA_cdr3_aa, sep = " | "),
+      TRUE ~ NA_character_
+    ),
+    clone_class = dplyr::case_when(
+      !is.na(TRA_cdr3_aa) & !is.na(TRB_cdr3_aa) ~ "Paired_TRA_TRB",
+      is.na(TRA_cdr3_aa) & !is.na(TRB_cdr3_aa) ~ "TRB_only",
+      !is.na(TRA_cdr3_aa) & is.na(TRB_cdr3_aa) ~ "TRA_only",
+      TRUE ~ "Unresolved"
+    )
+  )
+```
+
+```{r}
+#| label: add-clonotypes-to-object
+#| message: false
+#| warning: false
+
+md <- df@meta.data %>%
+  tibble::rownames_to_column("barcode") %>%
+  dplyr::mutate(sample = as.character(orig.ident))
+
+md2 <- md %>%
+  dplyr::left_join(
+    barcode_tcr_summary,
+    by = c("sample", "barcode")
+  ) %>%
+  dplyr::select(-sample) %>%
+  tibble::column_to_rownames("barcode")
+
+df@meta.data <- md2
+
+md_tcr <- df@meta.data %>%
+  tibble::rownames_to_column("cell") %>%
+  dplyr::filter(!is.na(clone_id_paired), clone_id_paired != "")
+
+# Pooled across all mice (kept for reference only; not used for inference)
+clone_size_global_df <- md_tcr %>%
+  dplyr::count(clone_id_paired, name = "clone_size_global")
+
+# Clone size WITHIN each mouse. Counting by Condition alone would pool the
+# four mice per group, so two cells from different mice sharing a CDR3
+# would be called "expanded". Expansion is therefore defined within a mouse.
+# (The column name is kept as clone_size_condition so downstream code runs
+# unchanged, but it now means "clone size within the mouse".)
+clone_size_condition_df <- md_tcr %>%
+  dplyr::filter(!is.na(Condition)) %>%
+  dplyr::count(Condition, orig.ident, clone_id_paired, name = "clone_size_condition")
+
+md_tcr <- md_tcr %>%
+  dplyr::left_join(clone_size_global_df, by = "clone_id_paired") %>%
+  dplyr::left_join(
+    clone_size_condition_df,
+    by = c("Condition", "orig.ident", "clone_id_paired")
+  ) %>%
+  dplyr::mutate(
+    expansion_status_global = dplyr::case_when(
+      clone_size_global == 1 ~ "Singleton",
+      clone_size_global > 1 ~ "Expanded",
+      TRUE ~ NA_character_
+    ),
+    expansion_status_condition = dplyr::case_when(
+      clone_size_condition == 1 ~ "Singleton",
+      clone_size_condition > 1 ~ "Expanded",
+      TRUE ~ NA_character_
+    )
+  )
+
+df$clone_size_global <- NA_real_
+df$clone_size_condition <- NA_real_
+df$expansion_status_global <- NA_character_
+df$expansion_status_condition <- NA_character_
+
+idx <- match(md_tcr$cell, colnames(df))
+
+df$clone_size_global[idx] <- md_tcr$clone_size_global
+df$clone_size_condition[idx] <- md_tcr$clone_size_condition
+df$expansion_status_global[idx] <- md_tcr$expansion_status_global
+df$expansion_status_condition[idx] <- md_tcr$expansion_status_condition
+
+df$expansion_status_global <- factor(
+  df$expansion_status_global,
+  levels = c("Singleton", "Expanded")
+)
+
+df$expansion_status_condition <- factor(
+  df$expansion_status_condition,
+  levels = c("Singleton", "Expanded")
+)
+```
+
+```{r}
+#| label: prepare-rna-for-de
+#| message: false
+#| warning: false
+
+if (!"RNA" %in% names(df@assays)) {
+  stop("RNA assay not found. Clonotype-informed DE should be run on the RNA assay.")
+}
+
+DefaultAssay(df) <- "RNA"
+
+if (inherits(df[["RNA"]], "Assay5")) {
+  df <- SeuratObject::JoinLayers(df, assay = "RNA")
+}
+
+df <- Seurat::NormalizeData(
+  df,
+  assay = "RNA",
+  verbose = FALSE
+)
+
+# Exclude TCR variable/joining/constant genes from all DE tests in this chapter.
+# Clonotypes are defined from the receptor sequence, so V/J gene usage is shared
+# by cells of the same clone by construction and would show up as "expansion"
+# genes without reflecting biology.
+tcr_genes <- grep("^Tr[abdg][vjc]", rownames(df), value = TRUE)
+df <- subset(df, features = setdiff(rownames(df), tcr_genes))
+
+# Small helper to standardise FindMarkers output across Seurat versions
+add_gene_and_sort <- function(x) {
+  fc_col <- dplyr::case_when(
+    "avg_log2FC" %in% colnames(x) ~ "avg_log2FC",
+    "avg_logFC" %in% colnames(x) ~ "avg_logFC",
+    TRUE ~ NA_character_
+  )
+
+  x <- x %>% tibble::rownames_to_column("gene")
+
+  if (!is.na(fc_col)) {
+    x <- x %>% dplyr::arrange(p_val_adj, dplyr::desc(.data[[fc_col]]))
+  } else {
+    x <- x %>% dplyr::arrange(p_val_adj)
+  }
+
+  x
+}
+```
+
+## Define expanded clonotypes
+
+Expanded clonotypes were defined as reconstructed clonotypes represented by more than one cell. Condition-specific expansion was used for TNFR2a versus Control comparisons, so that a clonotype expanded in one condition was not automatically considered expanded in the other.
+
+TCR variable, joining and constant genes (for example Trav*, Trbv*, Trac, Trbc*) were excluded from all differential expression tests in this chapter, because clonotype definition makes their expression non-independent of clone membership.
+
+```{r}
+#| label: tbl-expanded-clonotype-summary
+#| message: false
+#| warning: false
+#| tbl-cap: "Summary of condition-specific expanded and singleton clonotype assignments."
+
+expanded_clonotype_summary <- df@meta.data %>%
+  dplyr::filter(!is.na(Condition), !is.na(expansion_status_condition)) %>%
+  dplyr::count(Condition, expansion_status_condition) %>%
+  tidyr::pivot_wider(
+    names_from = expansion_status_condition,
+    values_from = n,
+    values_fill = 0
+  )
+
+knitr::kable(expanded_clonotype_summary)
+```
+
+## Subset cells from expanded clonotypes
+
+Cells belonging to condition-specific expanded clonotypes were isolated for downstream differential expression testing. This subset asks whether TNFR2a changes the transcriptional state of cells that are part of clonally expanded T-cell populations.
+
+```{r}
+#| label: subset-expanded-clone-cells
+#| message: false
+#| warning: false
+
+expanded_cells <- colnames(df)[
+  !is.na(df$expansion_status_condition) &
+    df$expansion_status_condition == "Expanded" &
+    !is.na(df$Condition)
+]
+
+df_expanded <- subset(df, cells = expanded_cells)
+
+Idents(df_expanded) <- "Condition"
+
+expanded_cell_summary <- df_expanded@meta.data %>%
+  dplyr::count(Condition, cluster_revised, name = "n_cells") %>%
+  dplyr::arrange(Condition, cluster_revised)
+
+knitr::kable(expanded_cell_summary)
+```
+
+## Differential expression: TNFR2a versus Control within expanded clonotypes
+
+Differential expression was performed between TNFR2a and Control using only cells assigned to condition-specific expanded clonotypes. This tests whether treatment-associated transcriptional differences are present within the expanded T-cell compartment.
+
+```{r}
+#| label: deg-tnfr2a-vs-control-expanded-clones
+#| message: false
+#| warning: false
+
+if (length(unique(df_expanded$Condition)) < 2) {
+  stop("Both TNFR2a and Control are required for DE testing in expanded clonotypes.")
+}
+
+deg_tnfr2a_vs_control_expanded <- Seurat::FindMarkers(
+  df_expanded,
+  ident.1 = "TNFR2a",
+  ident.2 = "Control",
+  assay = "RNA",
+  slot = "data",
+  test.use = "wilcox",
+  logfc.threshold = 0.1,
+  min.pct = 0.1
+) %>%
+  add_gene_and_sort()
+```
+
+Because expanded clonotypes are unevenly distributed across refined states, this comparison reflects both treatment-associated transcriptional differences and differences in the composition of expanded-clone states.
+
+```{r}
+#| label: tbl-top-deg-tnfr2a-vs-control-expanded-clones
+#| message: false
+#| warning: false
+#| tbl-cap: "Top differentially expressed genes comparing TNFR2a versus Control within condition-specific expanded clonotypes."
+
+deg_tnfr2a_vs_control_expanded %>%
+  dplyr::slice_head(n = 25) %>%
+  knitr::kable()
+```
+
+## Differential expression within expanded Treg_tissue_like clonotypes
+
+The same TNFR2a versus Control comparison was repeated within expanded Treg_tissue_like cells. This focuses on the expanded regulatory-like compartment. The test is run only if at least two mice per condition each contribute at least 10 expanded cells.
+
+```{r}
+#| label: subset-expanded-treg-cells
+#| message: false
+#| warning: false
+
+expanded_treg_cells <- colnames(df)[
+  df$cluster_revised == "Treg_tissue_like" &
+    !is.na(df$expansion_status_condition) &
+    df$expansion_status_condition == "Expanded" &
+    !is.na(df$Condition)
+]
+
+df_expanded_treg <- subset(df, cells = expanded_treg_cells)
+
+Idents(df_expanded_treg) <- "Condition"
+
+expanded_treg_summary <- df_expanded_treg@meta.data %>%
+  dplyr::count(Condition, name = "n_expanded_treg_cells")
+
+knitr::kable(expanded_treg_summary)
+```
+
+```{r}
+#| label: tbl-expanded-cells-per-mouse
+#| message: false
+#| warning: false
+#| tbl-cap: "TCR-assigned cells and cells in within-mouse expanded clonotypes, per mouse."
+
+df@meta.data %>%
+  dplyr::filter(!is.na(Condition), !is.na(expansion_status_condition)) %>%
+  dplyr::group_by(Condition, orig.ident) %>%
+  dplyr::summarise(
+    n_tcr_cells = dplyr::n(),
+    n_expanded_cells = sum(expansion_status_condition == "Expanded"),
+    pct_expanded = round(100 * n_expanded_cells / n_tcr_cells, 1),
+    n_expanded_clones = dplyr::n_distinct(clone_id_paired[expansion_status_condition == "Expanded"]),
+    .groups = "drop"
+  ) %>%
+  knitr::kable()
+```
+
+```{r}
+#| label: tbl-expanded-treg-cells-per-mouse
+#| message: false
+#| warning: false
+#| tbl-cap: "Cells in expanded Treg_tissue_like clonotypes per mouse (DE requires at least 2 mice per condition with at least 10 cells each)."
+
+df@meta.data %>%
+  dplyr::filter(
+    cluster_revised == "Treg_tissue_like",
+    !is.na(Condition),
+    expansion_status_condition == "Expanded"
+  ) %>%
+  dplyr::count(Condition, orig.ident, name = "n_expanded_treg_cells") %>%
+  dplyr::arrange(Condition, orig.ident) %>%
+  knitr::kable()
+```
+
+```{r}
+#| label: deg-tnfr2a-vs-control-expanded-treg
+#| message: false
+#| warning: false
+
+# A cell-level test is only meaningful if several mice contribute to each
+# condition. Require >= 2 mice per condition with >= 10 expanded Treg cells.
+min_cells_per_mouse <- 10
+min_mice_per_condition <- 2
+
+expanded_treg_mouse_counts <- df_expanded_treg@meta.data %>%
+  dplyr::count(Condition, orig.ident, name = "n")
+
+mice_ok <- expanded_treg_mouse_counts %>%
+  dplyr::filter(n >= min_cells_per_mouse) %>%
+  dplyr::count(Condition, name = "n_mice_ok")
+
+treg_de_testable <- all(c("TNFR2a", "Control") %in% mice_ok$Condition) &&
+  all(mice_ok$n_mice_ok[mice_ok$Condition %in% c("TNFR2a", "Control")] >= min_mice_per_condition)
+
+if (!treg_de_testable) {
+  deg_tnfr2a_vs_control_expanded_treg <- tibble::tibble()
+} else {
+  deg_tnfr2a_vs_control_expanded_treg <- Seurat::FindMarkers(
+    df_expanded_treg,
+    ident.1 = "TNFR2a",
+    ident.2 = "Control",
+    assay = "RNA",
+    slot = "data",
+    test.use = "wilcox",
+    logfc.threshold = 0.1,
+    min.pct = 0.1
+  ) %>%
+    add_gene_and_sort()
+}
+```
+
+```{r}
+#| label: tbl-top-deg-tnfr2a-vs-control-expanded-treg
+#| message: false
+#| warning: false
+#| tbl-cap: "Top differentially expressed genes comparing TNFR2a versus Control within expanded Treg_tissue_like clonotypes."
+
+if (nrow(deg_tnfr2a_vs_control_expanded_treg) > 0) {
+  deg_tnfr2a_vs_control_expanded_treg %>%
+    dplyr::slice_head(n = 25) %>%
+    knitr::kable()
+} else {
+  knitr::kable(
+    tibble::tibble(
+      message = "Not tested: fewer than two mice per condition contributed at least 10 expanded Treg_tissue_like cells (see the per-mouse table above)."
+    )
+  )
+}
+```
+
+## Expanded versus singleton cells
+
+Because expanded cells are concentrated in a few states, the same comparison was also run within individual states (Treg_tissue_like and Th1_cytotoxic_like), where state identity is held constant.
+
+To identify transcriptional features associated with clonal expansion itself, cells from expanded clonotypes were compared against singleton clonotype cells. This analysis was first performed across all TCR-assigned cells and then repeated within each condition.
+
+Expanded and singleton cells are not evenly spread across refined states, so differences in this comparison partly reflect state composition rather than expansion itself. The state distribution of each group is shown below.
+
+```{r}
+#| label: subset-expanded-and-singleton-cells
+#| message: false
+#| warning: false
+
+expansion_comparison_cells <- colnames(df)[
+  !is.na(df$expansion_status_condition) &
+    df$expansion_status_condition %in% c("Expanded", "Singleton") &
+    !is.na(df$Condition)
+]
+
+df_expansion_comparison <- subset(df, cells = expansion_comparison_cells)
+
+Idents(df_expansion_comparison) <- "expansion_status_condition"
+
+expansion_status_summary <- df_expansion_comparison@meta.data %>%
+  dplyr::count(Condition, expansion_status_condition, name = "n_cells")
+
+knitr::kable(expansion_status_summary)
+```
+
+```{r}
+#| label: deg-expanded-vs-singleton-all
+#| message: false
+#| warning: false
+
+deg_expanded_vs_singleton_all <- Seurat::FindMarkers(
+  df_expansion_comparison,
+  ident.1 = "Expanded",
+  ident.2 = "Singleton",
+  assay = "RNA",
+  slot = "data",
+  test.use = "wilcox",
+  logfc.threshold = 0.1,
+  min.pct = 0.1
+) %>%
+  add_gene_and_sort()
+```
+
+```{r}
+#| label: tbl-top-deg-expanded-vs-singleton-all
+#| message: false
+#| warning: false
+#| tbl-cap: "Top differentially expressed genes comparing expanded versus singleton clonotype cells across all conditions."
+
+deg_expanded_vs_singleton_all %>%
+  dplyr::slice_head(n = 25) %>%
+  knitr::kable()
+```
+
+```{r}
+#| label: tbl-expansion-state-composition
+#| message: false
+#| warning: false
+#| tbl-cap: "Distribution of expanded and singleton TCR-assigned cells across refined states (% of each group), per condition."
+
+df@meta.data %>%
+  dplyr::filter(!is.na(Condition), !is.na(expansion_status_condition)) %>%
+  dplyr::count(Condition, expansion_status_condition, cluster_revised) %>%
+  dplyr::group_by(Condition, expansion_status_condition) %>%
+  dplyr::mutate(pct = round(100 * n / sum(n), 1)) %>%
+  dplyr::ungroup() %>%
+  dplyr::select(-n) %>%
+  tidyr::pivot_wider(
+    names_from = c(Condition, expansion_status_condition),
+    values_from = pct,
+    values_fill = 0
+  ) %>%
+  dplyr::arrange(cluster_revised) %>%
+  knitr::kable()
+```
+
+## Expanded versus singleton cells within each condition
+
+Expanded and singleton cells were compared separately within Control and TNFR2a to determine whether the transcriptional signature of clonal expansion is condition-dependent.
+
+```{r}
+#| label: deg-expanded-vs-singleton-by-condition
+#| message: false
+#| warning: false
+
+run_expanded_vs_singleton <- function(seurat_obj, condition_name) {
+  obj <- subset(seurat_obj, subset = Condition == condition_name)
+  DefaultAssay(obj) <- "RNA"
+  Idents(obj) <- "expansion_status_condition"
+
+  status_counts <- table(obj$expansion_status_condition)
+
+  if (
+    !all(c("Expanded", "Singleton") %in% names(status_counts)) ||
+      any(status_counts[c("Expanded", "Singleton")] < 20)
+  ) {
+    return(tibble::tibble())
+  }
+
+  Seurat::FindMarkers(
+    obj,
+    ident.1 = "Expanded",
+    ident.2 = "Singleton",
+    assay = "RNA",
+    slot = "data",
+    test.use = "wilcox",
+    logfc.threshold = 0.1,
+    min.pct = 0.1
+  ) %>%
+    add_gene_and_sort() %>%
+    dplyr::mutate(Condition = condition_name)
+}
+
+deg_expanded_vs_singleton_control <- run_expanded_vs_singleton(
+  df_expansion_comparison,
+  "Control"
+)
+
+deg_expanded_vs_singleton_tnfr2a <- run_expanded_vs_singleton(
+  df_expansion_comparison,
+  "TNFR2a"
+)
+
+deg_expanded_vs_singleton_by_condition <- dplyr::bind_rows(
+  deg_expanded_vs_singleton_control,
+  deg_expanded_vs_singleton_tnfr2a
+)
+```
+
+```{r}
+#| label: tbl-top-deg-expanded-vs-singleton-by-condition
+#| message: false
+#| warning: false
+#| tbl-cap: "Top differentially expressed genes comparing expanded versus singleton clonotype cells within each condition."
+
+deg_expanded_vs_singleton_by_condition %>%
+  dplyr::group_by(Condition) %>%
+  dplyr::slice_head(n = 15) %>%
+  dplyr::ungroup() %>%
+  knitr::kable()
+```
+
+```{r}
+#| label: tbl-expanded-vs-singleton-within-state
+#| message: false
+#| warning: false
+#| tbl-cap: "Expanded versus singleton cells compared within a single refined state and condition (top 10 genes by log2FC among p_val_adj < 0.05; cell-level Wilcoxon, descriptive)."
+
+within_state_targets <- c("Treg_tissue_like", "Th1_cytotoxic_like")
+min_cells_group <- 20
+
+run_within_state <- function(state_name, condition_name) {
+  cells <- colnames(df)[
+    df$cluster_revised == state_name &
+      df$Condition == condition_name &
+      df$expansion_status_condition %in% c("Expanded", "Singleton")
+  ]
+  cells <- cells[!is.na(cells)]
+  obj <- subset(df, cells = cells)
+  DefaultAssay(obj) <- "RNA"
+  Idents(obj) <- "expansion_status_condition"
+
+  n_exp <- sum(obj$expansion_status_condition == "Expanded")
+  n_sing <- sum(obj$expansion_status_condition == "Singleton")
+  if (n_exp < min_cells_group || n_sing < min_cells_group) {
+    return(tibble::tibble(
+      state = state_name, Condition = condition_name,
+      n_expanded = n_exp, n_singleton = n_sing,
+      gene = NA_character_, avg_log2FC = NA_real_, p_val_adj = NA_real_
+    ))
+  }
+
+  Seurat::FindMarkers(
+    obj, ident.1 = "Expanded", ident.2 = "Singleton",
+    assay = "RNA", slot = "data", test.use = "wilcox",
+    logfc.threshold = 0.1, min.pct = 0.1
+  ) %>%
+    add_gene_and_sort() %>%
+    dplyr::filter(p_val_adj < 0.05) %>%
+    dplyr::arrange(dplyr::desc(avg_log2FC)) %>%
+    dplyr::slice_head(n = 10) %>%
+    dplyr::transmute(
+      state = state_name, Condition = condition_name,
+      n_expanded = n_exp, n_singleton = n_sing,
+      gene, avg_log2FC = round(avg_log2FC, 2), p_val_adj = signif(p_val_adj, 2)
+    )
+}
+
+deg_expanded_vs_singleton_within_state <- purrr::map_dfr(
+  within_state_targets,
+  function(s) purrr::map_dfr(c("Control", "TNFR2a"), function(cn) run_within_state(s, cn))
+)
+
+knitr::kable(deg_expanded_vs_singleton_within_state)
+```
+
+## Treg_tissue_like expanded versus singleton cells
+
+Expanded and singleton clonotype cells were also compared specifically within the Treg_tissue_like state. This tests whether clonal expansion in the regulatory-like compartment is associated with a distinct transcriptional program.
+
+```{r}
+#| label: deg-expanded-vs-singleton-treg
+#| message: false
+#| warning: false
+
+treg_expansion_cells <- colnames(df)[
+  df$cluster_revised == "Treg_tissue_like" &
+    !is.na(df$expansion_status_condition) &
+    df$expansion_status_condition %in% c("Expanded", "Singleton") &
+    !is.na(df$Condition)
+]
+
+df_treg_expansion <- subset(df, cells = treg_expansion_cells)
+
+DefaultAssay(df_treg_expansion) <- "RNA"
+Idents(df_treg_expansion) <- "expansion_status_condition"
+
+treg_expansion_summary <- df_treg_expansion@meta.data %>%
+  dplyr::count(Condition, expansion_status_condition, name = "n_cells")
+
+knitr::kable(treg_expansion_summary)
+
+deg_expanded_vs_singleton_treg <- Seurat::FindMarkers(
+  df_treg_expansion,
+  ident.1 = "Expanded",
+  ident.2 = "Singleton",
+  assay = "RNA",
+  slot = "data",
+  test.use = "wilcox",
+  logfc.threshold = 0.1,
+  min.pct = 0.1
+) %>%
+  add_gene_and_sort()
+```
+
+```{r}
+#| label: tbl-top-deg-expanded-vs-singleton-treg
+#| message: false
+#| warning: false
+#| tbl-cap: "Top differentially expressed genes comparing expanded versus singleton Treg_tissue_like cells."
+
+deg_expanded_vs_singleton_treg %>%
+  dplyr::slice_head(n = 25) %>%
+  knitr::kable()
+```
+
+## Save DEG tables for pathway analysis
+
+Differential expression results were exported as CSV files so that pathway enrichment can be performed in the downstream pathway analysis chapter.
+
+```{r}
+#| label: save-clonotype-informed-deg-tables
+#| message: false
+#| warning: false
+
+dir.create("tables/clonotype_informed_de", recursive = TRUE, showWarnings = FALSE)
+
+readr::write_csv(
+  expanded_clonotype_summary,
+  "tables/clonotype_informed_de/expanded_clonotype_summary.csv"
+)
+
+readr::write_csv(
+  expanded_cell_summary,
+  "tables/clonotype_informed_de/expanded_cell_summary.csv"
+)
+
+readr::write_csv(
+  deg_tnfr2a_vs_control_expanded,
+  "tables/clonotype_informed_de/deg_tnfr2a_vs_control_expanded_clones.csv"
+)
+
+readr::write_csv(
+  deg_tnfr2a_vs_control_expanded_treg,
+  "tables/clonotype_informed_de/deg_tnfr2a_vs_control_expanded_treg_tissue_like.csv"
+)
+
+readr::write_csv(
+  deg_expanded_vs_singleton_all,
+  "tables/clonotype_informed_de/deg_expanded_vs_singleton_all.csv"
+)
+
+readr::write_csv(
+  deg_expanded_vs_singleton_by_condition,
+  "tables/clonotype_informed_de/deg_expanded_vs_singleton_by_condition.csv"
+)
+
+readr::write_csv(
+  deg_expanded_vs_singleton_treg,
+  "tables/clonotype_informed_de/deg_expanded_vs_singleton_treg_tissue_like.csv"
+)
+```
+
+## Interpretation
+
+This chapter asked whether transcriptional differences between TNFR2a and control mice sit within clonally expanded CD4⁺ T cells, and what distinguishes expanded cells from singletons. Expansion was defined within each mouse, and TCR segment genes were excluded from all tests.
+
+**Treatment within expanded clones.** Among cells in expanded clonotypes, TNFR2a mice show higher *Tnfrsf1b*, *Tnfrsf9*, *Foxp3*, *Ikzf2* and *Itgae* and lower *Cd40lg* and *Tcf7*. The state table explains much of this: Treg tissue-like and cycling cells make up a much larger share of expanded cells in TNFR2a mice, so the comparison mixes a change of composition with any change within states. A test restricted to expanded Treg tissue-like cells was not run, because too few mice contributed enough expanded Treg cells. This is consistent with the polyclonal Treg expansion described in the TCR chapter.
+
+**Expansion itself.** Expanded cells, compared with singletons, show a strong effector and tissue-residency program (*Cxcr6*, *Nkg7*, *Ifng*, *Ccl5*, *Cd44*, *S100a4*, *Rora*, *Id2*) and loss of naive/quiescence genes (*Lef1*, *Ccr7*, *Sell*, *Satb1*, *Bach2*, *Foxp1*). The signature is nearly identical in both arms, so clonal expansion is tightly coupled to effector differentiation whatever the treatment. Part of this contrast reflects state composition: expanded cells are mostly Th1/cytotoxic-like, and singletons mostly naive-like.
+
+**Within tissue Tregs.** Expanded and singleton Treg tissue-like cells did not differ significantly, again consistent with a Treg compartment that grows without clonal selection.
+
+All tests in this chapter are cell-level Wilcoxon tests, which treat cells as independent and therefore overstate significance. They are descriptive and are not used for formal inference.
+
+### Key findings
+
+- Clonal expansion is coupled to an effector/tissue program (*Cxcr6*, *Ifng*, *Nkg7*, *Ccl5*) and loss of quiescence genes. The signature is the same in both treatment arms.
+- Within expanded clones, TNFR2a-associated differences (*Tnfrsf1b*, *Tnfrsf9*, *Foxp3*, *Ikzf2*) largely reflect more Treg tissue-like and cycling cells among expanded cells.
+- Expanded and singleton tissue Tregs are transcriptionally similar, supporting polyclonal, TCR-independent expansion of tissue Tregs under TNFR2 agonism.

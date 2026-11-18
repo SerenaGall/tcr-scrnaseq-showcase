@@ -1,0 +1,1527 @@
+---
+title: "TCR clonotype analysis"
+execute:
+  echo: true
+  message: false
+  warning: false
+
+---
+
+```{r}
+#| label: setup
+#| message: false
+#| warning: false
+
+source("R/setup.R")
+source("R/helpers.R")
+```
+
+## Overview
+
+This chapter analyses clonal structure and clonal expansion from the contig-level TCR table built during preprocessing. Barcode-level receptor summaries are rebuilt from productive contigs, clonotypes are defined from CDR3 amino-acid sequences in a chain-aware way, and clonotype information is joined to the refined transcriptional states.
+
+Working at contig level keeps TRA and TRB chains separate, so paired, TRB-only and TRA-only receptors can be distinguished. The same code runs on Cell Ranger `filtered_contig_annotations.csv` files. For this public dataset, V/J gene calls and UMI counts were not deposited, so V-gene-level summaries are skipped automatically.
+
+```{r}
+#| label: load-objects
+#| message: false
+#| warning: false
+
+df <- readRDS("data/TCRseq_revised_clustering.rds")
+vdj_contigs_list <- readRDS("data/vdj_contigs_list.rds")
+
+stopifnot("cluster_revised" %in% colnames(df@meta.data))
+Idents(df) <- "cluster_revised"
+
+state_levels <- state_levels_all
+
+stopifnot(setequal(state_levels, unique(as.character(df$cluster_revised))))
+df$cluster_revised <- factor(df$cluster_revised, levels = state_levels)
+
+df$cluster_revised <- factor(df$cluster_revised, levels = state_levels)
+
+if (!"Condition" %in% colnames(df@meta.data)) {
+  df$Condition <- dplyr::case_when(
+    grepl("^TNFR2a_", df$orig.ident) ~ "TNFR2a",
+    grepl("^Ctrl_", df$orig.ident) ~ "Control",
+    TRUE ~ NA_character_
+  )
+}
+
+# Basic sanity checks on VDJ input
+if (!is.list(vdj_contigs_list) || length(vdj_contigs_list) == 0) {
+  stop("vdj_contigs_list is empty or not a list.")
+}
+
+if (!all(vapply(vdj_contigs_list, is.data.frame, logical(1)))) {
+  stop("All elements of vdj_contigs_list must be data frames.")
+}
+```
+
+## Reconstruct barcode-level TRA/TRB summaries from contigs
+
+The first step rebuilds barcode-level receptor summaries from the contig table. Productive contigs are kept, and chain-specific summaries are generated for each barcode. Where a barcode has several contigs for the same chain, the best-supported contig (highest UMI count, then read count) is chosen as the primary chain. UMI and read counts are not available for this dataset, so the first contig listed is used.
+
+```{r}
+#| label: combine-contigs
+#| message: false
+#| warning: false
+
+vdj_contigs <- bind_rows(vdj_contigs_list, .id = "sample_list_name")
+
+if (nrow(vdj_contigs) == 0) {
+  stop("Combined VDJ contig table is empty.")
+}
+
+# Harmonise sample label if already present
+if ("sample" %in% colnames(vdj_contigs)) {
+  vdj_contigs <- vdj_contigs %>%
+    dplyr::mutate(sample = ifelse(is.na(sample) | sample == "", sample_list_name, sample))
+} else {
+  vdj_contigs <- vdj_contigs %>%
+    dplyr::mutate(sample = sample_list_name)
+}
+
+# Keep productive contigs only, if available
+if ("productive" %in% colnames(vdj_contigs)) {
+  vdj_contigs <- vdj_contigs %>%
+    dplyr::filter(productive %in% TRUE)
+}
+
+# Keep TCR chains only, if chain column exists
+if ("chain" %in% colnames(vdj_contigs)) {
+  vdj_contigs <- vdj_contigs %>%
+    dplyr::filter(chain %in% c("TRA", "TRB"))
+}
+
+# Require essential columns
+required_cols <- c("barcode", "cdr3", "sample")
+missing_required <- setdiff(required_cols, colnames(vdj_contigs))
+
+if (length(missing_required) > 0) {
+  stop(
+    paste(
+      "VDJ contig table is missing required columns:",
+      paste(missing_required, collapse = ", ")
+    )
+  )
+}
+
+# Map sample names to merged Seurat barcode suffixes
+# sample_suffix_map is defined in R/setup.R (sample -> barcode suffix)
+
+vdj_contigs <- vdj_contigs %>%
+  dplyr::left_join(sample_suffix_map, by = "sample")
+
+if (any(is.na(vdj_contigs$suffix))) {
+  missing_samples <- vdj_contigs %>%
+    dplyr::filter(is.na(suffix)) %>%
+    dplyr::distinct(sample) %>%
+    dplyr::pull(sample)
+
+  stop(
+    paste(
+      "Some samples in vdj_contigs were not found in sample_suffix_map:",
+      paste(missing_samples, collapse = ", ")
+    )
+  )
+}
+
+# Remove any existing merged-object suffix, then append the correct one
+vdj_contigs <- vdj_contigs %>%
+  dplyr::mutate(
+    barcode_raw = barcode,
+    barcode_base = sub("(_\\d+)$", "", barcode),
+    barcode = paste0(barcode_base, suffix)
+  ) %>%
+  dplyr::select(-barcode_base)
+
+if (nrow(vdj_contigs) == 0) {
+  stop("No contigs remain after productive/chain filtering.")
+}
+```
+
+```{r}
+#| label: choose-primary-contigs
+#| message: false
+#| warning: false
+
+has_umis <- "umis" %in% colnames(vdj_contigs)
+has_reads <- "reads" %in% colnames(vdj_contigs)
+
+ranked_contigs <- vdj_contigs %>%
+  mutate(
+    umis_rank = if (has_umis) umis else NA_real_,
+    reads_rank = if (has_reads) reads else NA_real_
+  ) %>%
+  group_by(sample, barcode, chain) %>%
+  arrange(desc(umis_rank), desc(reads_rank), .by_group = TRUE) %>%
+  mutate(chain_rank = row_number()) %>%
+  ungroup()
+
+primary_contigs <- ranked_contigs %>%
+  filter(chain_rank == 1)
+
+if (nrow(primary_contigs) == 0) {
+  stop("No primary contigs retained after ranking.")
+}
+```
+
+```{r}
+#| label: build-barcode-tcr-summary
+#| message: false
+#| warning: false
+
+has_cdr3_nt <- "cdr3_nt" %in% colnames(primary_contigs)
+has_v_gene  <- "v_gene" %in% colnames(primary_contigs)
+has_j_gene  <- "j_gene" %in% colnames(primary_contigs)
+
+barcode_tcr_summary <- primary_contigs %>%
+  group_by(sample, barcode) %>%
+  summarise(
+    TRA_cdr3_aa = {
+      x <- cdr3[chain == "TRA"]
+      if (length(x) == 0) NA_character_ else paste(x, collapse = ";")
+    },
+    TRB_cdr3_aa = {
+      x <- cdr3[chain == "TRB"]
+      if (length(x) == 0) NA_character_ else paste(x, collapse = ";")
+    },
+    TRA_cdr3_nt = {
+      if (!has_cdr3_nt) {
+        NA_character_
+      } else {
+        x <- cdr3_nt[chain == "TRA"]
+        if (length(x) == 0) NA_character_ else paste(x, collapse = ";")
+      }
+    },
+    TRB_cdr3_nt = {
+      if (!has_cdr3_nt) {
+        NA_character_
+      } else {
+        x <- cdr3_nt[chain == "TRB"]
+        if (length(x) == 0) NA_character_ else paste(x, collapse = ";")
+      }
+    },
+    TRA_v_gene = {
+      if (!has_v_gene) {
+        NA_character_
+      } else {
+        x <- v_gene[chain == "TRA"]
+        if (length(x) == 0) NA_character_ else paste(x, collapse = ";")
+      }
+    },
+    TRB_v_gene = {
+      if (!has_v_gene) {
+        NA_character_
+      } else {
+        x <- v_gene[chain == "TRB"]
+        if (length(x) == 0) NA_character_ else paste(x, collapse = ";")
+      }
+    },
+    TRA_j_gene = {
+      if (!has_j_gene) {
+        NA_character_
+      } else {
+        x <- j_gene[chain == "TRA"]
+        if (length(x) == 0) NA_character_ else paste(x, collapse = ";")
+      }
+    },
+    TRB_j_gene = {
+      if (!has_j_gene) {
+        NA_character_
+      } else {
+        x <- j_gene[chain == "TRB"]
+        if (length(x) == 0) NA_character_ else paste(x, collapse = ";")
+      }
+    },
+    n_primary_chains = n(),
+    has_TRA = any(chain == "TRA"),
+    has_TRB = any(chain == "TRB"),
+    .groups = "drop"
+  ) %>%
+  mutate(
+    clone_id_paired = case_when(
+      !is.na(TRA_cdr3_aa) & !is.na(TRB_cdr3_aa) ~ paste(TRA_cdr3_aa, TRB_cdr3_aa, sep = " | "),
+      !is.na(TRB_cdr3_aa) ~ paste("TRB_only", TRB_cdr3_aa, sep = " | "),
+      !is.na(TRA_cdr3_aa) ~ paste("TRA_only", TRA_cdr3_aa, sep = " | "),
+      TRUE ~ NA_character_
+    ),
+    clone_class = case_when(
+      !is.na(TRA_cdr3_aa) & !is.na(TRB_cdr3_aa) ~ "Paired_TRA_TRB",
+      is.na(TRA_cdr3_aa) & !is.na(TRB_cdr3_aa) ~ "TRB_only",
+      !is.na(TRA_cdr3_aa) & is.na(TRB_cdr3_aa) ~ "TRA_only",
+      TRUE ~ "Unresolved"
+    )
+  )
+
+if (nrow(barcode_tcr_summary) == 0) {
+  stop("Barcode-level TCR summary is empty.")
+}
+```
+
+## Integrate reconstructed clonotypes with the Seurat object
+
+```{r}
+#| label: add-tcr-summary-to-object
+#| message: false
+#| warning: false
+
+# Build metadata table from Seurat object
+md <- df@meta.data %>%
+  tibble::rownames_to_column("barcode")
+
+# Derive a sample key on the Seurat side that matches the contig-side `sample`
+# First try orig.ident directly; if that fails in your data, you can swap this to another metadata field.
+md <- md %>%
+  dplyr::mutate(sample = as.character(orig.ident))
+
+# Check whether barcode_tcr_summary is unique by sample + barcode
+dup_tcr <- barcode_tcr_summary %>%
+  dplyr::count(sample, barcode, name = "n") %>%
+  dplyr::filter(n > 1)
+
+if (nrow(dup_tcr) > 0) {
+  stop(
+    paste0(
+      "barcode_tcr_summary is not unique by sample + barcode. ",
+      "Found ", nrow(dup_tcr), " duplicated keys."
+    )
+  )
+}
+
+# Check whether Seurat metadata is unique by sample + barcode
+dup_md <- md %>%
+  dplyr::count(sample, barcode, name = "n") %>%
+  dplyr::filter(n > 1)
+
+if (nrow(dup_md) > 0) {
+  stop(
+    paste0(
+      "Seurat metadata is not unique by sample + barcode. ",
+      "Found ", nrow(dup_md), " duplicated keys."
+    )
+  )
+}
+
+# Join on sample + barcode, not barcode alone
+md2 <- md %>%
+  dplyr::left_join(
+    barcode_tcr_summary,
+    by = c("sample", "barcode")
+  )
+
+# Restore rownames using the original unique barcode column from the Seurat object
+md2 <- md2 %>%
+  dplyr::select(-sample) %>%
+  tibble::column_to_rownames("barcode")
+
+df@meta.data <- md2
+
+df$clone_class <- factor(
+  df$clone_class,
+  levels = c("Paired_TRA_TRB", "TRB_only", "TRA_only", "Unresolved")
+)
+
+# Sanity checks after barcode join
+stopifnot("clone_id_paired" %in% colnames(df@meta.data))
+
+n_cells_total <- ncol(df)
+n_cells_assigned <- sum(!is.na(df$clone_id_paired))
+frac_cells_assigned <- mean(!is.na(df$clone_id_paired))
+
+message("Cells in object: ", n_cells_total)
+message("Cells with clonotype assignment: ", n_cells_assigned)
+message("Fraction assigned: ", round(frac_cells_assigned, 3))
+
+if (n_cells_assigned == 0) {
+  stop("No clonotype assignments were mapped back to the Seurat object. Check sample/barcode matching.")
+}
+```
+
+```{r}
+#| label: tbl-tcr-reconstruction-summary
+#| message: false
+#| warning: false
+#| tbl-cap: "Summary of reconstructed barcode-level TCR assignments."
+
+tcr_reconstruction_summary <- tibble(
+  metric = c(
+    "Cells in revised Seurat object",
+    "Cells with reconstructed clonotype",
+    "Cells with paired TRA/TRB",
+    "Cells with TRB only",
+    "Cells with TRA only"
+  ),
+  value = c(
+    ncol(df),
+    sum(!is.na(df$clone_id_paired)),
+    sum(df$clone_class == "Paired_TRA_TRB", na.rm = TRUE),
+    sum(df$clone_class == "TRB_only", na.rm = TRUE),
+    sum(df$clone_class == "TRA_only", na.rm = TRUE)
+  )
+)
+
+knitr::kable(tcr_reconstruction_summary)
+```
+
+## Clonotype overview
+
+Clone sizes were calculated from the reconstructed sequence-based clonotype identifier (clone_id_paired). Global clone size was used for overall descriptive summaries, while condition-specific clone size was recalculated within each treatment group for condition-level comparisons.
+
+```{r}
+#| label: make-clonotype-metadata
+#| message: false
+#| warning: false
+
+md_tcr <- df@meta.data %>%
+  tibble::rownames_to_column("cell") %>%
+  dplyr::filter(!is.na(clone_id_paired), clone_id_paired != "")
+
+clone_size_global_df <- md_tcr %>%
+  dplyr::count(clone_id_paired, name = "clone_size_global") %>%
+  dplyr::arrange(dplyr::desc(clone_size_global))
+
+# NOTE: clone size is counted within each mouse (orig.ident), not pooled
+# across mice in a condition. The column name is kept so downstream chunks
+# and chapters still work.
+clone_size_condition_df <- md_tcr %>%
+  dplyr::filter(!is.na(Condition)) %>%
+  dplyr::count(Condition, orig.ident, clone_id_paired, name = "clone_size_condition")
+
+clone_size_sample_df <- md_tcr %>%
+  dplyr::count(orig.ident, clone_id_paired, name = "clone_size_sample")
+
+md_tcr <- md_tcr %>%
+  dplyr::left_join(clone_size_global_df, by = "clone_id_paired") %>%
+  dplyr::left_join(
+    clone_size_condition_df,
+    by = c("Condition", "orig.ident", "clone_id_paired")
+  ) %>%
+  dplyr::left_join(
+    clone_size_sample_df,
+    by = c("orig.ident", "clone_id_paired")
+  ) %>%
+  dplyr::mutate(
+    clone_size_class_global = dplyr::case_when(
+      clone_size_global == 1 ~ "Singleton",
+      clone_size_global >= 2 & clone_size_global <= 4 ~ "Small (2-4)",
+      clone_size_global >= 5 & clone_size_global <= 9 ~ "Medium (5-9)",
+      clone_size_global >= 10 ~ "Large (>=10)",
+      TRUE ~ NA_character_
+    ),
+    clone_size_class_condition = dplyr::case_when(
+      clone_size_condition == 1 ~ "Singleton",
+      clone_size_condition >= 2 & clone_size_condition <= 4 ~ "Small (2-4)",
+      clone_size_condition >= 5 & clone_size_condition <= 9 ~ "Medium (5-9)",
+      clone_size_condition >= 10 ~ "Large (>=10)",
+      TRUE ~ NA_character_
+    )
+  )
+
+md_tcr$clone_size_class_global <- factor(
+  md_tcr$clone_size_class_global,
+  levels = c(
+    "Singleton",
+    "Small (2-4)",
+    "Medium (5-9)",
+    "Large (>=10)"
+  )
+)
+
+md_tcr$clone_size_class_condition <- factor(
+  md_tcr$clone_size_class_condition,
+  levels = c(
+    "Singleton",
+    "Small (2-4)",
+    "Medium (5-9)",
+    "Large (>=10)"
+  )
+)
+
+## Overall number of VDJ/TCR rearrangements by condition
+
+vdj_condition_summary <- md_tcr %>%
+  dplyr::filter(
+    !is.na(Condition),
+    !is.na(clone_id_paired),
+    clone_id_paired != ""
+  ) %>%
+  dplyr::group_by(Condition) %>%
+  dplyr::summarise(
+    n_tcr_assigned_cells = dplyr::n(),
+    n_unique_rearrangements = dplyr::n_distinct(clone_id_paired),
+    .groups = "drop"
+  )
+
+knitr::kable(vdj_condition_summary)
+```
+
+```{r}
+#| label: fig-vdj-rearrangements-by-condition
+#| fig-cap: "Number of unique reconstructed VDJ rearrangements by condition."
+#| fig-width: 6
+#| fig-height: 4
+#| fig-dpi: 300
+
+ggplot2::ggplot(
+  vdj_condition_summary,
+  ggplot2::aes(x = Condition, y = n_unique_rearrangements, fill = Condition)
+) +
+  ggplot2::geom_col() +
+  ggplot2::theme_bw() +
+  ggplot2::labs(
+    x = NULL,
+    y = "Number of unique reconstructed VDJ rearrangements"
+  ) +
+  ggplot2::theme(legend.position = "none")
+```
+
+```{r}
+#| label: fig-tnfr2a-vdj-rearrangements
+#| fig-cap: "TNFR2a reconstructed VDJ rearrangements ranked by number of TCR-assigned cells."
+#| fig-width: 10
+#| fig-height: 8
+#| fig-dpi: 300
+
+tnfr2a_rearrangements <- md_tcr %>%
+  dplyr::filter(
+    Condition == "TNFR2a",
+    !is.na(clone_id_paired),
+    clone_id_paired != ""
+  ) %>%
+  dplyr::count(clone_id_paired, name = "n_cells") %>%
+  dplyr::mutate(
+    percent_cells = n_cells / sum(n_cells),
+    clone_label = stringr::str_trunc(clone_id_paired, width = 55),
+    label = paste0(n_cells, " cells; ", scales::percent(percent_cells, accuracy = 0.1))
+  ) %>%
+  dplyr::arrange(n_cells)
+
+ggplot2::ggplot(
+  tnfr2a_rearrangements,
+  ggplot2::aes(x = forcats::fct_reorder(clone_label, n_cells), y = n_cells)
+) +
+  ggplot2::geom_col() +
+  ggplot2::geom_text(
+    ggplot2::aes(label = label),
+    hjust = -0.05,
+    size = 2.8
+  ) +
+  ggplot2::coord_flip() +
+  ggplot2::theme_bw() +
+  ggplot2::labs(
+    x = "Reconstructed VDJ rearrangement",
+    y = "Number of TNFR2a TCR-assigned cells"
+  ) +
+  ggplot2::expand_limits(y = max(tnfr2a_rearrangements$n_cells) * 1.25)
+```
+
+```{r}
+#| label: tbl-tnfr2a-vdj-rearrangements
+#| tbl-cap: "TNFR2a reconstructed VDJ rearrangements ranked by number of TCR-assigned cells."
+#| message: false
+#| warning: false
+
+tnfr2a_rearrangements <- md_tcr %>%
+  dplyr::filter(
+    Condition == "TNFR2a",
+    !is.na(clone_id_paired),
+    clone_id_paired != ""
+  ) %>%
+  dplyr::count(clone_id_paired, name = "n_cells") %>%
+  dplyr::mutate(
+    percent_cells = n_cells / sum(n_cells)
+  ) %>%
+  dplyr::arrange(dplyr::desc(n_cells)) %>%
+  dplyr::mutate(rank = dplyr::row_number()) %>%
+  dplyr::select(
+    Rank = rank,
+    `Reconstructed VDJ rearrangement` = clone_id_paired,
+    `Number of TNFR2a TCR-assigned cells` = n_cells,
+    `% of TNFR2a TCR-assigned cells` = percent_cells
+  )
+
+# Display table
+tnfr2a_rearrangements %>%
+  dplyr::mutate(
+    `% of TNFR2a TCR-assigned cells` =
+      scales::percent(`% of TNFR2a TCR-assigned cells`, accuracy = 0.1)
+  ) %>%
+  knitr::kable(
+    align = c("r", "l", "r", "r")
+  )
+
+# Save table
+if (!dir.exists("tables")) {
+  dir.create("tables", recursive = TRUE)
+}
+
+readr::write_csv(
+  tnfr2a_rearrangements,
+  file = "tables/tnfr2a_vdj_rearrangements.csv"
+)
+```
+
+```{r}
+#| label: fig-tnfr2a-trb-cdr3-logo
+#| fig-cap: "Sequence logo of the most common TNFR2a TRB CDR3 amino acid rearrangements, filtered to the most common CDR3 length."
+#| fig-width: 8
+#| fig-height: 4
+#| fig-dpi: 300
+
+library(ggseqlogo)
+
+tnfr2a_top_trb <- md_tcr %>%
+  dplyr::filter(
+    Condition == "TNFR2a",
+    !is.na(TRB_cdr3_aa),
+    TRB_cdr3_aa != ""
+  ) %>%
+  dplyr::count(TRB_cdr3_aa, name = "n_cells") %>%
+  dplyr::mutate(cdr3_length = nchar(TRB_cdr3_aa))
+
+common_length <- tnfr2a_top_trb %>%
+  dplyr::count(cdr3_length, wt = n_cells, name = "n_cells_total") %>%
+  dplyr::slice_max(n_cells_total, n = 1, with_ties = FALSE) %>%
+  dplyr::pull(cdr3_length)
+
+tnfr2a_top_trb_logo <- tnfr2a_top_trb %>%
+  dplyr::filter(cdr3_length == common_length) %>%
+  dplyr::slice_max(order_by = n_cells, n = 20, with_ties = FALSE)
+
+ggseqlogo::ggseqlogo(tnfr2a_top_trb_logo$TRB_cdr3_aa, method = "bits") +
+  ggplot2::theme_bw() +
+  ggplot2::labs(
+    title = "Most common TNFR2a TRB CDR3 sequences",
+    subtitle = paste0("Top TRB sequences with CDR3 length = ", common_length)
+  )
+```
+
+```{r}
+#| label: add-clone-size-to-object
+#| message: false
+#| warning: false
+
+df$clone_size_global <- NA_real_
+df$clone_size_condition <- NA_real_
+df$clone_size_class_global <- NA_character_
+df$clone_size_class_condition <- NA_character_
+
+idx <- match(md_tcr$cell, colnames(df))
+
+df$clone_size_global[idx] <- md_tcr$clone_size_global
+df$clone_size_condition[idx] <- md_tcr$clone_size_condition
+df$clone_size_class_global[idx] <- as.character(md_tcr$clone_size_class_global)
+df$clone_size_class_condition[idx] <- as.character(md_tcr$clone_size_class_condition)
+
+df$clone_size_class_global <- factor(
+  df$clone_size_class_global,
+  levels = c("Singleton", "Small (2-4)", "Medium (5-9)", "Large (>=10)")
+)
+
+df$clone_size_class_condition <- factor(
+  df$clone_size_class_condition,
+  levels = c("Singleton", "Small (2-4)", "Medium (5-9)", "Large (>=10)")
+)
+```
+
+```{r}
+#| label: tbl-clonotype-summary
+#| message: false
+#| warning: false
+#| tbl-cap: "Summary of reconstructed sequence-based clonotype expansion across all TCR-assigned cells."
+
+if (nrow(clone_size_global_df) == 0) {
+  stop("No clonotypes reconstructed after barcode matching.")
+}
+
+clonotype_summary <- tibble(
+  metric = c(
+    "Cells with clonotype assignment",
+    "Unique reconstructed clonotypes",
+    "Largest global clonotype size",
+    "Median global clonotype size"
+  ),
+  value = c(
+    nrow(md_tcr),
+    n_distinct(md_tcr$clone_id_paired),
+    max(clone_size_global_df$clone_size_global),
+    median(clone_size_global_df$clone_size_global)
+  )
+)
+
+knitr::kable(clonotype_summary)
+```
+
+## Global clone size distribution
+
+```{r}
+#| label: fig-clone-size-distribution
+#| message: false
+#| warning: false
+#| fig-cap: "Distribution of reconstructed global clonotype sizes across all TCR-assigned cells."
+#| fig-width: 7
+#| fig-height: 5
+#| fig-dpi: 300
+
+ggplot(clone_size_global_df, aes(x = clone_size_global)) +
+  geom_histogram(bins = 50) +
+  theme_bw() +
+  labs(
+    x = "Number of cells per reconstructed clonotype",
+    y = "Number of clonotypes"
+  )
+```
+
+```{r}
+#| label: tbl-top-clonotypes
+#| message: false
+#| warning: false
+#| tbl-cap: "Top reconstructed clonotypes ranked by global number of cells."
+
+top_clonotypes <- clone_size_global_df %>%
+  slice_max(order_by = clone_size_global, n = 20, with_ties = FALSE)
+
+knitr::kable(top_clonotypes)
+```
+
+```{r}
+#| label: define-top-clonotypes
+#| message: false
+#| warning: false
+
+n_top_clones <- 10
+
+top_clone_ids <- clone_size_global_df %>%
+  slice_max(order_by = clone_size_global, n = n_top_clones, with_ties = FALSE) %>%
+  pull(clone_id_paired)
+
+df$top_clonotype_plot <- ifelse(
+  df$clone_id_paired %in% top_clone_ids,
+  df$clone_id_paired,
+  "Other"
+)
+
+df$top_clonotype_plot[is.na(df$top_clonotype_plot)] <- "Other"
+
+clone_levels <- c(
+  "Other",
+  clone_size_global_df %>%
+    filter(clone_id_paired %in% top_clone_ids) %>%
+    arrange(desc(clone_size_global)) %>%
+    pull(clone_id_paired)
+)
+
+df$top_clonotype_plot <- factor(df$top_clonotype_plot, levels = clone_levels)
+```
+
+```{r}
+#| label: fig-umap-top-clonotypes-faceted
+#| message: false
+#| warning: false
+#| fig-cap: "UMAP embedding showing the distribution of the top 10 reconstructed clonotypes. Each panel highlights one dominant clonotype against the full cellular background."
+#| fig-width: 12
+#| fig-height: 10
+#| fig-dpi: 300
+
+umap_df <- as.data.frame(Embeddings(df, reduction = "umap")) %>%
+  rownames_to_column("cell")
+
+colnames(umap_df)[2:3] <- c("UMAP_1", "UMAP_2")
+
+umap_df <- umap_df %>%
+  left_join(
+    df@meta.data %>%
+      rownames_to_column("cell") %>%
+      select(cell, clone_id_paired),
+    by = "cell"
+  )
+
+plot_list <- lapply(top_clone_ids, function(cl) {
+  umap_df %>%
+    mutate(
+      clonotype_panel = cl,
+      highlight = ifelse(clone_id_paired == cl, "Highlighted", "Other")
+    )
+})
+
+plot_df <- bind_rows(plot_list)
+
+panel_levels <- clone_size_global_df %>%
+  filter(clone_id_paired %in% top_clone_ids) %>%
+  arrange(desc(clone_size_global)) %>%
+  mutate(
+    panel_label = paste0("clone ", row_number(), " (n=", clone_size_global, ")")
+  )
+
+plot_df <- plot_df %>%
+  left_join(
+    panel_levels %>% select(clone_id_paired, panel_label),
+    by = c("clonotype_panel" = "clone_id_paired")
+  )
+
+plot_df$panel_label <- factor(plot_df$panel_label, levels = panel_levels$panel_label)
+
+ggplot(plot_df, aes(x = UMAP_1, y = UMAP_2)) +
+  geom_point(
+    data = subset(plot_df, highlight == "Other"),
+    color = "grey85",
+    size = 0.15,
+    alpha = 0.6
+  ) +
+  geom_point(
+    data = subset(plot_df, highlight == "Highlighted"),
+    size = 0.35,
+    alpha = 0.9
+  ) +
+  facet_wrap(~ panel_label, ncol = 2) +
+  theme_bw() +
+  labs(x = "UMAP 1", y = "UMAP 2") +
+  theme(
+    strip.text = element_text(size = 10),
+    panel.grid = element_blank()
+  )
+```
+
+## Clonotype expansion per revised state
+
+Cluster-level summaries were calculated using the revised provisional state labels generated during clustering refinement rather than the original over-partitioned cluster assignments.
+
+```{r}
+#| label: fig-umap-clone-size-class
+#| message: false
+#| warning: false
+#| fig-cap: "UMAP embedding coloured by global reconstructed clonotype expansion class."
+#| fig-width: 7
+#| fig-height: 5
+#| fig-dpi: 300
+
+DimPlot(
+  df,
+  reduction = "umap",
+  group.by = "clone_size_class_global",
+  shuffle = TRUE,
+  pt.size = 0.4,
+  na.value = "grey85"
+)
+```
+
+```{r}
+#| label: tbl-clone-size-by-cluster
+#| message: false
+#| warning: false
+#| tbl-cap: "Counts of cells in each global reconstructed clonotype expansion class across revised states."
+
+clone_cluster_tab <- df@meta.data %>%
+  dplyr::mutate(cluster = as.character(cluster_revised)) %>%
+  dplyr::filter(!is.na(cluster), !is.na(clone_size_class_global)) %>%
+  dplyr::count(cluster, clone_size_class_global) %>%
+  tidyr::pivot_wider(
+    names_from = clone_size_class_global,
+    values_from = n,
+    values_fill = 0
+  )
+
+knitr::kable(clone_cluster_tab)
+```
+
+```{r}
+#| label: fig-clone-size-by-cluster
+#| message: false
+#| warning: false
+#| fig-cap: "Relative composition of global reconstructed clonotype expansion classes within each revised state."
+#| fig-width: 9
+#| fig-height: 5
+#| fig-dpi: 300
+
+clone_cluster_prop <- df@meta.data %>%
+  mutate(cluster = as.character(cluster_revised)) %>%
+  filter(!is.na(cluster), !is.na(clone_size_class_global)) %>%
+  dplyr::count(cluster, clone_size_class_global) %>%
+  group_by(cluster) %>%
+  mutate(prop = n / sum(n))
+
+ggplot(clone_cluster_prop, aes(x = cluster, y = prop, fill = clone_size_class_global)) +
+  geom_col(position = "fill") +
+  theme_bw() +
+  scale_y_continuous(labels = scales::percent_format()) +
+  labs(
+    x = "Revised state",
+    y = "Proportion of cells",
+    fill = "Global clonotype size"
+  ) +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+```
+
+## Clonotype expansion per condition
+
+Clone-size classes were recalculated within each mouse rather than using global or condition-pooled clone sizes. This prevents a clonotype that appears in several animals from being classed as expanded when each animal contributes only a few cells.
+
+```{r}
+#| label: tbl-clone-size-by-condition
+#| message: false
+#| warning: false
+#| tbl-cap: "Counts of cells in each condition-specific reconstructed clonotype expansion class by condition."
+
+clone_condition_tab <- df@meta.data %>%
+  filter(!is.na(clone_size_class_condition), !is.na(Condition)) %>%
+  dplyr::count(Condition, clone_size_class_condition) %>%
+  pivot_wider(names_from = clone_size_class_condition, values_from = n, values_fill = 0)
+
+knitr::kable(clone_condition_tab)
+```
+
+```{r}
+#| label: fig-clone-size-by-condition
+#| message: false
+#| warning: false
+#| fig-cap: "Relative distribution of condition-specific reconstructed clonotype expansion classes by treatment condition."
+#| fig-width: 7
+#| fig-height: 5
+#| fig-dpi: 300
+
+clone_condition_prop <- df@meta.data %>%
+  filter(!is.na(clone_size_class_condition), !is.na(Condition)) %>%
+  dplyr::count(Condition, clone_size_class_condition) %>%
+  group_by(Condition) %>%
+  mutate(prop = n / sum(n))
+
+ggplot(clone_condition_prop, aes(x = Condition, y = prop, fill = clone_size_class_condition)) +
+  geom_col(position = "fill") +
+  theme_bw() +
+  scale_y_continuous(labels = scales::percent_format()) +
+  labs(
+    x = NULL,
+    y = "Proportion of cells",
+    fill = "Condition-specific\nclonotype size"
+  )
+```
+
+```{r}
+#| label: fig-umap-expanded-clones-split-condition
+#| message: false
+#| warning: false
+#| fig-cap: "UMAP embedding split by condition and coloured by condition-specific reconstructed clonotype expansion class."
+#| fig-width: 10
+#| fig-height: 5
+#| fig-dpi: 300
+
+DimPlot(
+  df,
+  reduction = "umap",
+  group.by = "clone_size_class_condition",
+  split.by = "Condition",
+  shuffle = TRUE,
+  pt.size = 0.4,
+  na.value = "grey85"
+)
+```
+
+## Cluster-specific clonal expansion by condition
+
+Clone expansion within each transcriptional state is summarised below using clone sizes counted within individual mice. Interpretation is descriptive: cells from the same clonotype are not independent, and each condition has four mice.
+
+```{r}
+#| label: fig-cluster-condition-expanded-heatmap
+#| message: false
+#| warning: false
+#| fig-cap: "Heatmap showing the proportion of TCR-assigned cells belonging to condition-specific expanded reconstructed clonotypes within each revised state and condition."
+#| fig-width: 8
+#| fig-height: 5
+#| fig-dpi: 300
+
+heat_df <- df@meta.data %>%
+  mutate(
+    cluster = as.character(cluster_revised),
+    expanded = case_when(
+      !is.na(clone_size_condition) & clone_size_condition > 1 ~ "Expanded",
+      !is.na(clone_size_condition) & clone_size_condition == 1 ~ "Singleton",
+      TRUE ~ NA_character_
+    )
+  ) %>%
+  filter(!is.na(expanded), !is.na(Condition), !is.na(cluster)) %>%
+  dplyr::count(Condition, cluster, expanded) %>%
+  pivot_wider(names_from = expanded, values_from = n, values_fill = 0) %>%
+  mutate(
+    total = Expanded + Singleton,
+    prop_expanded = ifelse(total > 0, Expanded / total, NA_real_)
+  )
+
+ggplot(heat_df, aes(x = cluster, y = Condition, fill = prop_expanded)) +
+  geom_tile(color = "white") +
+  geom_text(aes(label = scales::percent(prop_expanded, accuracy = 1)), size = 3) +
+  theme_bw() +
+  labs(
+    x = "Revised state",
+    y = NULL,
+    fill = "Expanded\nfraction"
+  ) +
+  theme(
+    panel.grid = element_blank(),
+    axis.text.x = element_text(angle = 45, hjust = 1)
+  )
+```
+
+## Dominant clonotypes within each revised state by condition
+
+These plots identify the most abundant reconstructed clonotypes within each revised state and compare their representation between TNFR2a and Control.
+
+```{r}
+#| label: make-top-clones-by-cluster-condition
+#| message: false
+#| warning: false
+
+n_top_cluster_clones <- 10
+
+cluster_clone_condition_df <- md_tcr %>%
+  dplyr::filter(
+    !is.na(cluster_revised),
+    !is.na(Condition),
+    !is.na(clone_id_paired),
+    clone_id_paired != ""
+  ) %>%
+  dplyr::mutate(
+    cluster = as.character(cluster_revised)
+  ) %>%
+  dplyr::count(cluster, Condition, clone_id_paired, name = "n_cells")
+
+top_clones_by_cluster <- cluster_clone_condition_df %>%
+  dplyr::group_by(cluster, clone_id_paired) %>%
+  dplyr::summarise(
+    n_cells_cluster_total = sum(n_cells),
+    .groups = "drop"
+  ) %>%
+  dplyr::group_by(cluster) %>%
+  dplyr::slice_max(
+    order_by = n_cells_cluster_total,
+    n = n_top_cluster_clones,
+    with_ties = FALSE
+  ) %>%
+  dplyr::ungroup()
+
+top_clones_cluster_condition_df <- top_clones_by_cluster %>%
+  dplyr::select(cluster, clone_id_paired, n_cells_cluster_total) %>%
+  tidyr::expand_grid(
+    Condition = sort(unique(stats::na.omit(cluster_clone_condition_df$Condition)))
+  ) %>%
+  dplyr::left_join(
+    cluster_clone_condition_df,
+    by = c("cluster", "Condition", "clone_id_paired")
+  ) %>%
+  dplyr::mutate(
+    n_cells = tidyr::replace_na(n_cells, 0L)
+  ) %>%
+  dplyr::group_by(cluster, Condition) %>%
+  dplyr::mutate(
+    total_tcr_cells_cluster_condition = sum(n_cells[
+      clone_id_paired %in% unique(top_clones_by_cluster$clone_id_paired)
+    ])
+  ) %>%
+  dplyr::ungroup()
+
+# Denominator should be all TCR-assigned cells in each cluster-condition,
+# not only cells from the selected top clones.
+cluster_condition_denoms <- md_tcr %>%
+  dplyr::filter(!is.na(cluster_revised), !is.na(Condition)) %>%
+  dplyr::mutate(cluster = as.character(cluster_revised)) %>%
+  dplyr::count(cluster, Condition, name = "n_tcr_cells_cluster_condition")
+
+top_clones_cluster_condition_df <- top_clones_cluster_condition_df %>%
+  dplyr::left_join(
+    cluster_condition_denoms,
+    by = c("cluster", "Condition")
+  ) %>%
+  dplyr::mutate(
+    prop_tcr_cells = dplyr::if_else(
+      n_tcr_cells_cluster_condition > 0,
+      n_cells / n_tcr_cells_cluster_condition,
+      NA_real_
+    ),
+    clone_label = paste0(
+      stringr::str_trunc(clone_id_paired, width = 42),
+      " (total n=", n_cells_cluster_total, ")"
+    )
+  )
+```
+
+```{r}
+#| label: fig-top-clones-treg-tissue-like-condition
+#| message: false
+#| warning: false
+#| fig-cap: "Most abundant reconstructed clonotypes within the Treg_tissue_like state, comparing their frequency in TNFR2a and Control."
+#| fig-width: 10
+#| fig-height: 6
+#| fig-dpi: 300
+
+treg_top_clone_levels <- top_clones_cluster_condition_df %>%
+  dplyr::filter(cluster == "Treg_tissue_like") %>%
+  dplyr::distinct(clone_label, n_cells_cluster_total) %>%
+  dplyr::arrange(n_cells_cluster_total) %>%
+  dplyr::pull(clone_label)
+
+top_clones_cluster_condition_df %>%
+  dplyr::filter(cluster == "Treg_tissue_like") %>%
+  dplyr::mutate(
+    clone_label = factor(clone_label, levels = treg_top_clone_levels),
+    Condition = factor(Condition, levels = c("Control", "TNFR2a"))
+  ) %>%
+  ggplot2::ggplot(
+    ggplot2::aes(
+      x = clone_label,
+      y = n_cells,
+      fill = Condition
+    )
+  ) +
+  ggplot2::geom_col(position = ggplot2::position_dodge(width = 0.8)) +
+  ggplot2::coord_flip() +
+  ggplot2::theme_bw() +
+  ggplot2::labs(
+    x = "Reconstructed clonotype",
+    y = "Number of TCR-assigned cells",
+    fill = "Condition"
+  )
+```
+
+```{r}
+#| label: fig-top-clones-treg-tissue-like-condition-proportion
+#| message: false
+#| warning: false
+#| fig-cap: "Most abundant reconstructed clonotypes within the Treg_tissue_like state, shown as a proportion of TCR-assigned cells in each condition."
+#| fig-width: 10
+#| fig-height: 6
+#| fig-dpi: 300
+
+top_clones_cluster_condition_df %>%
+  dplyr::filter(cluster == "Treg_tissue_like") %>%
+  dplyr::mutate(
+    clone_label = factor(clone_label, levels = treg_top_clone_levels),
+    Condition = factor(Condition, levels = c("Control", "TNFR2a"))
+  ) %>%
+  ggplot2::ggplot(
+    ggplot2::aes(
+      x = clone_label,
+      y = prop_tcr_cells,
+      fill = Condition
+    )
+  ) +
+  ggplot2::geom_col(position = ggplot2::position_dodge(width = 0.8)) +
+  ggplot2::coord_flip() +
+  ggplot2::theme_bw() +
+  ggplot2::scale_y_continuous(labels = scales::percent_format()) +
+  ggplot2::labs(
+    x = "Reconstructed clonotype",
+    y = "Proportion of TCR-assigned cells",
+    fill = "Condition"
+  )
+```
+
+```{r}
+#| label: fig-top-clones-all-clusters-condition
+#| message: false
+#| warning: false
+#| fig-cap: "Most abundant reconstructed clonotypes within each revised state, comparing their cell counts in TNFR2a and Control."
+#| fig-width: 14
+#| fig-height: 14
+#| fig-dpi: 300
+
+top_clones_cluster_condition_df %>%
+  dplyr::mutate(
+    clone_label = forcats::fct_reorder(clone_label, n_cells_cluster_total),
+    Condition = factor(Condition, levels = c("Control", "TNFR2a")),
+    cluster = factor(cluster, levels = state_levels)
+  ) %>%
+  ggplot2::ggplot(
+    ggplot2::aes(
+      x = clone_label,
+      y = n_cells,
+      fill = Condition
+    )
+  ) +
+  ggplot2::geom_col(position = ggplot2::position_dodge(width = 0.8)) +
+  ggplot2::coord_flip() +
+  ggplot2::facet_wrap(~ cluster, scales = "free_y", ncol = 2) +
+  ggplot2::theme_bw() +
+  ggplot2::labs(
+    x = "Top reconstructed clonotypes within revised state",
+    y = "Number of TCR-assigned cells",
+    fill = "Condition"
+  ) +
+  ggplot2::theme(
+    strip.text = ggplot2::element_text(size = 10),
+    axis.text.y = ggplot2::element_text(size = 6)
+  )
+```
+
+```{r}
+#| label: fig-top-clones-all-clusters-condition-proportion
+#| message: false
+#| warning: false
+#| fig-cap: "Most abundant reconstructed clonotypes within each revised state, comparing their proportional representation in TNFR2a and Control."
+#| fig-width: 14
+#| fig-height: 14
+#| fig-dpi: 300
+
+top_clones_cluster_condition_df %>%
+  dplyr::mutate(
+    clone_label = forcats::fct_reorder(clone_label, n_cells_cluster_total),
+    Condition = factor(Condition, levels = c("Control", "TNFR2a")),
+    cluster = factor(cluster, levels = state_levels)
+  ) %>%
+  ggplot2::ggplot(
+    ggplot2::aes(
+      x = clone_label,
+      y = prop_tcr_cells,
+      fill = Condition
+    )
+  ) +
+  ggplot2::geom_col(position = ggplot2::position_dodge(width = 0.8)) +
+  ggplot2::coord_flip() +
+  ggplot2::facet_wrap(~ cluster, scales = "free_y", ncol = 2) +
+  ggplot2::theme_bw() +
+  ggplot2::scale_y_continuous(labels = scales::percent_format()) +
+  ggplot2::labs(
+    x = "Top reconstructed clonotypes within revised state",
+    y = "Proportion of TCR-assigned cells",
+    fill = "Condition"
+  ) +
+  ggplot2::theme(
+    strip.text = ggplot2::element_text(size = 10),
+    axis.text.y = ggplot2::element_text(size = 6)
+  )
+```
+
+## Clonotype sharing across samples
+
+Because clonotypes are now defined using reconstructed chain-aware sequence features rather than sample-local labels, cross-sample sharing analyses are more defensible.
+
+```{r}
+#| label: make-clonotype-overlap-matrix
+#| message: false
+#| warning: false
+
+sample_clono <- md_tcr %>%
+  distinct(orig.ident, clone_id_paired) %>%
+  mutate(present = 1) %>%
+  pivot_wider(
+    names_from = clone_id_paired,
+    values_from = present,
+    values_fill = 0
+  )
+
+sample_mat <- as.data.frame(sample_clono)
+rownames(sample_mat) <- sample_mat$orig.ident
+sample_mat$orig.ident <- NULL
+sample_mat <- as.matrix(sample_mat)
+
+overlap_mat <- sample_mat %*% t(sample_mat)
+```
+
+```{r}
+#| label: make-clonotype-jaccard-matrix
+#| message: false
+#| warning: false
+
+sample_names <- rownames(sample_mat)
+jaccard_mat <- matrix(NA_real_, nrow = nrow(sample_mat), ncol = nrow(sample_mat))
+rownames(jaccard_mat) <- sample_names
+colnames(jaccard_mat) <- sample_names
+
+for (i in seq_len(nrow(sample_mat))) {
+  for (j in seq_len(nrow(sample_mat))) {
+    a <- sample_mat[i, ] > 0
+    b <- sample_mat[j, ] > 0
+    inter <- sum(a & b)
+    union <- sum(a | b)
+    jaccard_mat[i, j] <- ifelse(union > 0, inter / union, NA_real_)
+  }
+}
+```
+
+```{r}
+#| label: fig-clonotype-jaccard-heatmap
+#| message: false
+#| warning: false
+#| fig-cap: "Heatmap showing Jaccard similarity of reconstructed clonotype repertoires between samples."
+#| fig-width: 7
+#| fig-height: 6
+#| fig-dpi: 300
+
+jaccard_df <- as.data.frame(as.table(jaccard_mat))
+colnames(jaccard_df) <- c("Sample1", "Sample2", "Jaccard")
+
+ggplot(jaccard_df, aes(x = Sample1, y = Sample2, fill = Jaccard)) +
+  geom_tile() +
+  geom_text(aes(label = sprintf("%.2f", Jaccard)), size = 3) +
+  theme_bw() +
+  coord_equal() +
+  labs(x = NULL, y = NULL, fill = "Jaccard") +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+```
+
+```{r}
+#| label: fig-clonotype-overlap-heatmap
+#| message: false
+#| warning: false
+#| fig-cap: "Heatmap showing the number of shared reconstructed clonotypes between samples."
+#| fig-width: 7
+#| fig-height: 6
+#| fig-dpi: 300
+
+overlap_df <- as.data.frame(as.table(overlap_mat))
+colnames(overlap_df) <- c("Sample1", "Sample2", "SharedClonotypes")
+
+ggplot(overlap_df, aes(x = Sample1, y = Sample2, fill = SharedClonotypes)) +
+  geom_tile() +
+  geom_text(aes(label = SharedClonotypes), size = 3) +
+  theme_bw() +
+  coord_equal() +
+  labs(x = NULL, y = NULL, fill = "Shared\nclonotypes") +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+```
+
+```{r}
+#| label: tbl-private-vs-shared
+#| message: false
+#| warning: false
+#| tbl-cap: "Number of private and shared reconstructed clonotypes across samples."
+
+clono_sample_counts <- md_tcr %>%
+  distinct(orig.ident, clone_id_paired) %>%
+  dplyr::count(clone_id_paired, name = "n_samples") %>%
+  mutate(
+    sharing = case_when(
+      n_samples == 1 ~ "Private",
+      n_samples > 1 ~ "Shared"
+    )
+  ) %>%
+  dplyr::count(sharing)
+
+knitr::kable(clono_sample_counts)
+```
+
+## Quantifying Treg_tissue_like clonal dominance by condition
+
+The preceding plots were produced from clone sizes pooled across mice. Because the same clonotype can be counted across animals, and because pooled counts hide mouse-to-mouse variation, clone size and dominance were recalculated separately within each mouse (@tbl-treg-clone-dominance-summary).
+
+```{r}
+#| label: tbl-treg-clone-dominance-summary
+#| message: false
+#| warning: false
+#| tbl-cap: "Summary of Treg_tissue_like clonotype expansion and dominance metrics by condition."
+
+treg_clone_sizes <- md_tcr %>%
+  dplyr::filter(
+    cluster_revised == "Treg_tissue_like",
+    !is.na(Condition),
+    !is.na(clone_id_paired),
+    clone_id_paired != ""
+  ) %>%
+  dplyr::count(Condition, orig.ident, clone_id_paired, name = "clone_size")
+
+treg_clone_dominance_summary <- treg_clone_sizes %>%
+  dplyr::group_by(Condition, orig.ident) %>%
+  dplyr::arrange(dplyr::desc(clone_size), .by_group = TRUE) %>%
+  dplyr::mutate(
+    clone_rank = dplyr::row_number(),
+    expanded = clone_size > 1,
+    large_clone = clone_size >= 10
+  ) %>%
+  dplyr::summarise(
+    n_treg_tcr_cells = sum(clone_size),
+    n_unique_clonotypes = dplyr::n_distinct(clone_id_paired),
+    max_clone_size = max(clone_size),
+    median_clone_size = stats::median(clone_size),
+    mean_clone_size = mean(clone_size),
+    fraction_cells_in_expanded_clones = sum(clone_size[expanded]) / sum(clone_size),
+    fraction_cells_in_large_clones = sum(clone_size[large_clone]) / sum(clone_size),
+    top_5_clone_fraction = sum(clone_size[clone_rank <= 5]) / sum(clone_size),
+    top_10_clone_fraction = sum(clone_size[clone_rank <= 10]) / sum(clone_size),
+    .groups = "drop"
+  )
+
+knitr::kable(
+  treg_clone_dominance_summary,
+  digits = 2,
+  caption = "Per-mouse Treg_tissue_like clone expansion (each row is one mouse)."
+)
+```
+
+@fig-treg-clone-size-distribution-condition shows the per-mouse clone-size distribution. Almost all Treg_tissue_like clonotypes are singletons in every mouse, and the largest clone contains `r max(treg_clone_dominance_summary$max_clone_size, na.rm = TRUE)` cells.
+
+```{r}
+#| label: fig-treg-clone-size-distribution-condition
+#| message: false
+#| warning: false
+#| fig-cap: "Per-mouse distribution of reconstructed clonotype sizes within Treg_tissue_like cells. Each panel is one mouse."
+#| fig-width: 8
+#| fig-height: 5
+#| fig-dpi: 300
+
+ggplot2::ggplot(
+  treg_clone_sizes,
+  ggplot2::aes(x = factor(clone_size), fill = Condition)
+) +
+  ggplot2::geom_bar() +
+  ggplot2::facet_wrap(~ orig.ident, nrow = 2) +
+  ggplot2::scale_y_log10() +
+  ggplot2::theme_bw() +
+  ggplot2::labs(
+    x = "Number of Treg_tissue_like cells per clonotype",
+    y = "Number of clonotypes (log10)",
+    fill = "Condition"
+  )
+```
+
+
+
+
+## Save outputs
+
+```{r}
+#| label: save-clonotype-summary-tables
+#| message: false
+#| warning: false
+
+readr::write_csv(barcode_tcr_summary, "tables/barcode_tcr_summary.csv")
+readr::write_csv(clonotype_summary, "tables/clonotype_summary.csv")
+readr::write_csv(top_clonotypes, "tables/top_clonotypes.csv")
+readr::write_csv(clone_cluster_tab, "tables/clone_size_by_cluster.csv")
+readr::write_csv(clone_condition_tab, "tables/clone_size_by_condition.csv")
+readr::write_csv(clono_sample_counts, "tables/private_vs_shared_clonotypes.csv")
+readr::write_csv(as.data.frame(as.table(overlap_mat)), "tables/clonotype_overlap_counts_by_sample.csv")
+readr::write_csv(as.data.frame(as.table(jaccard_mat)), "tables/clonotype_jaccard_by_sample.csv")
+
+readr::write_csv(
+  treg_clone_dominance_summary,
+  "tables/treg_clone_dominance_summary_by_mouse.csv"
+)
+
+readr::write_csv(
+  treg_clone_sizes,
+  "tables/treg_clone_sizes_by_mouse.csv"
+)
+```
+
+```{r}
+#| label: tbl-expansion-by-state-per-mouse
+#| message: false
+#| warning: false
+#| tbl-cap: "Cells in expanded clones (size >= 2 within a mouse) by revised state, summarised per mouse."
+
+expansion_by_state <- md_tcr %>%
+  dplyr::filter(!is.na(cluster_revised), !is.na(clone_size_sample)) %>%
+  dplyr::group_by(cluster_revised, orig.ident) %>%
+  dplyr::summarise(
+    n_cells = dplyr::n(),
+    pct_expanded = 100 * mean(clone_size_sample >= 2),
+    .groups = "drop"
+  ) %>%
+  dplyr::group_by(cluster_revised) %>%
+  dplyr::summarise(
+    total_cells_with_tcr = sum(n_cells),
+    mice_with_ge20_cells = sum(n_cells >= 20),
+    median_pct_expanded = round(median(pct_expanded[n_cells >= 20]), 1),
+    min_pct_expanded = round(min(pct_expanded[n_cells >= 20]), 1),
+    max_pct_expanded = round(max(pct_expanded[n_cells >= 20]), 1),
+    .groups = "drop"
+  ) %>%
+  dplyr::arrange(dplyr::desc(median_pct_expanded))
+
+knitr::kable(expansion_by_state)
+
+# Global largest clones: how many mice does each one span?
+top_global <- md_tcr %>%
+  dplyr::group_by(clone_id_paired) %>%
+  dplyr::summarise(
+    size = dplyr::n(),
+    n_mice = dplyr::n_distinct(orig.ident),
+    .groups = "drop"
+  ) %>%
+  dplyr::arrange(dplyr::desc(size)) %>%
+  dplyr::slice_head(n = 10)
+
+knitr::kable(top_global, caption = "Ten largest clonotypes overall and the number of mice each spans.")
+```
+
+```{r}
+#| label: tbl-single-chain-check
+#| message: false
+#| warning: false
+#| tbl-cap: "Effect of single-chain cells on clone definitions."
+
+# 1. How many TCR-assigned cells are single-chain?
+chain_counts <- md_tcr %>%
+  dplyr::count(Condition, clone_class) %>%
+  tidyr::pivot_wider(names_from = clone_class, values_from = n, values_fill = 0)
+knitr::kable(chain_counts, caption = "TCR-assigned cells by chain completeness.")
+
+# 2. How many TRA_only cells share their alpha CDR3 with a paired clone?
+paired_alpha <- md_tcr %>%
+  dplyr::filter(clone_class == "Paired_TRA_TRB") %>%
+  dplyr::pull(TRA_cdr3_aa) %>% unique()
+
+tra_only <- md_tcr %>% dplyr::filter(clone_class == "TRA_only")
+cat("TRA_only cells:", nrow(tra_only),
+    "| sharing alpha CDR3 with a paired clone:",
+    sum(tra_only$TRA_cdr3_aa %in% paired_alpha), "\n")
+
+paired_beta <- md_tcr %>%
+  dplyr::filter(clone_class == "Paired_TRA_TRB") %>%
+  dplyr::pull(TRB_cdr3_aa) %>% unique()
+
+trb_only <- md_tcr %>% dplyr::filter(clone_class == "TRB_only")
+cat("TRB_only cells:", nrow(trb_only),
+    "| sharing beta CDR3 with a paired clone:",
+    sum(trb_only$TRB_cdr3_aa %in% paired_beta), "\n")
+
+# 3. Per-mouse % of cells in expanded clones by state: all cells vs paired only
+expansion_compare <- function(dat, label) {
+  dat %>%
+    dplyr::add_count(orig.ident, clone_id_paired, name = "sz") %>%
+    dplyr::group_by(cluster_revised, orig.ident) %>%
+    dplyr::summarise(n = dplyr::n(), pct = 100 * mean(sz >= 2), .groups = "drop") %>%
+    dplyr::filter(n >= 20) %>%
+    dplyr::group_by(cluster_revised) %>%
+    dplyr::summarise(!!label := round(median(pct), 1), .groups = "drop")
+}
+
+cmp <- dplyr::full_join(
+  expansion_compare(md_tcr, "median_pct_expanded_all"),
+  expansion_compare(dplyr::filter(md_tcr, clone_class == "Paired_TRA_TRB"),
+                    "median_pct_expanded_paired_only"),
+  by = "cluster_revised"
+)
+knitr::kable(cmp, caption = "Median % of cells in expanded clones: all TCR cells vs fully paired cells only.")
+```
+
+## Interpretation
+
+TCR chains were recovered for about 90% of cells, and roughly three-quarters of cells carried both a TRA and a TRB chain, so most of the dataset can be read at clonotype level.
+
+The lung CD4⁺ repertoire is highly diverse. Most clonotypes are seen in a single cell, and almost all clonotypes are private to one mouse: only a handful are shared between animals. This is expected for polyclonal CD4⁺ T cells from unimmunised mice.
+
+Clonal expansion is concentrated in effector states:
+
+- **Th1/cytotoxic-like** cells hold most of the expanded cells, including nearly all clones of ten or more cells within a mouse.
+- **Activated/memory-like** and **cycling** states also contain expanded clones.
+- **Naive-like** and **Treg resting-like** cells are almost entirely singletons, consistent with antigen-inexperienced or homeostatic populations.
+
+TNFR2 agonism does not focus the repertoire on a few dominant clones. TNFR2a-treated mice have more cells in large clones than controls, but these sit mainly in the Th1/cytotoxic-like and cycling states, and they come from a few mice rather than all of them, so they should not be over-interpreted.
+
+### Interpretation of Treg_tissue_like clonal dominance
+
+TNFR2a quadruples the size of the Treg tissue-like compartment, yet its clonal structure hardly changes:
+
+- Almost every Treg tissue-like clonotype is a singleton in every mouse.
+- The largest clone contains only a few cells.
+- The fraction of Treg tissue-like cells in expanded clones is low in both arms.
+
+The expansion is therefore **polyclonal**. TNFR2 signalling enlarges the tissue Treg pool across many clonotypes at once, instead of selecting a few antigen-specific clones. This fits a cytokine-receptor-driven mechanism better than a TCR-driven one.
+
+## Summary
+
+- At least one TCR chain was recovered for about 90% of cells. Clonotypes are highly diverse and almost entirely private to each mouse.
+- Clonal expansion is concentrated in Th1/cytotoxic-like, activated/memory-like and cycling cells, while naive-like and resting Treg cells are almost entirely singletons.
+- TNFR2 agonism expands tissue Tregs polyclonally, with no emergence of dominant Treg clones.
+- Clone sizes are counted within each mouse throughout, so clonotypes shared between animals do not inflate expansion estimates.

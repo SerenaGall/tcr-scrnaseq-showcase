@@ -1,0 +1,26 @@
+# Private source material: never publish
+AIP2_scRNAseq_quarto/
+
+# Large data and regenerated intermediates
+data/
+output/
+tables/
+*.rds
+*.RDS
+
+# Quarto
+/.quarto/
+/_book/
+*_files/
+
+# R / OS
+.Rhistory
+.RData
+.Rproj.user/
+.DS_Store
+
+**/*.quarto_ipynb
+*.rmarkdown
+figures/
+render_log_*.txt
+.claude/

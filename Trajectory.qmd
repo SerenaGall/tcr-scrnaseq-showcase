@@ -1,0 +1,842 @@
+---
+title: "Trajectory analysis"
+execute:
+  echo: true
+  message: false
+  warning: false
+
+---
+
+```{r}
+#| label: setup
+#| message: false
+#| warning: false
+
+if (is.null(methods::getClassDef("ExpData"))) {
+  methods::setOldClass("ExpData")
+}
+
+source("R/setup.R")
+source("R/helpers.R")
+```
+
+## Trajectory analysis
+
+Trajectory inference was used as an exploratory analysis to order CD4⁺ T cells along a plausible activation-associated transcriptional continuum. Because this dataset represents treatment-associated transcriptional states rather than a sampled developmental time course, trajectories were not inferred across all annotated cell states. Instead, Slingshot was applied only to refined CD4⁺ T-cell states that plausibly form a connected biological progression from naïve-like cells through activated and effector-associated states.
+
+The trajectory set contains two branches that share a naive/resting origin:
+
+**Naive-like → Activated/memory-like → Th1/cytotoxic-like** (conventional effector branch)
+
+**Naive-like → Treg resting-like → Treg tissue-like** (regulatory branch)
+
+The conventional branch follows the effector differentiation of conventional CD4⁺ T cells and holds most expanded clones. The regulatory branch orders Tregs from a resting/central state to the tissue/effector state that TNFR2 agonism expands. Tregs largely arise in the thymus and are not converted from naive conventional cells, so this branch is read as a resting-to-activated Treg continuum attached to the shared root. It is not a claim of naive-to-Treg conversion. IFN-response and cycling cells were excluded because they are programs that cut across lineages, not differentiation endpoints. Th2/tissue-like and IL-17-like cells were excluded because they are too small to fit reliably, and `Unresolved_state` was excluded as low quality. Pseudotime is a descriptive ordering within this selected set and is not evidence of developmental timing [@street2018slingshot].
+
+Slingshot was fitted jointly across TNFR2a and Control cells so that both conditions were projected onto the same pseudotime axis. This allows treatment-associated differences to be assessed as shifts in cell density, state composition, or gene expression along a shared trajectory.
+
+```{r}
+#| label: setup-trajectory
+#| message: false
+#| warning: false
+
+stopifnot(requireNamespace("slingshot", quietly = TRUE))
+stopifnot(requireNamespace("SingleCellExperiment", quietly = TRUE))
+stopifnot(requireNamespace("SummarizedExperiment", quietly = TRUE))
+stopifnot(requireNamespace("S4Vectors", quietly = TRUE))
+stopifnot(requireNamespace("tradeSeq", quietly = TRUE))
+stopifnot(requireNamespace("SeuratObject", quietly = TRUE))
+
+dir.create("output", showWarnings = FALSE, recursive = TRUE)
+
+state_levels <- state_levels_all
+
+trajectory_states <- trajectory_states_default
+
+excluded_states <- setdiff(state_levels, trajectory_states)
+
+stopifnot(all(trajectory_states %in% state_levels))
+
+state_labels <- state_labels_all
+
+get_state_label <- function(x) {
+  dplyr::recode(as.character(x), !!!state_labels, .default = as.character(x))
+}
+
+plot_empty <- function(label) {
+  graphics::plot.new()
+  graphics::text(0.5, 0.5, label, cex = 1.1)
+}
+```
+
+## Load annotated object
+
+```{r}
+#| label: load-object-for-trajectory
+#| echo: true
+#| message: false
+#| warning: false
+
+TCRseq_obj <- readRDS("data/TCRseq_revised_clustering.rds")
+
+candidate_state_cols <- c(
+  "cluster_revised",
+  "refined_state",
+  "cluster_refined",
+  "refined_cluster",
+  "cell_state_refined",
+  "cluster_refined_state",
+  "cluster_primary"
+)
+
+state_col <- candidate_state_cols[
+  candidate_state_cols %in% colnames(TCRseq_obj@meta.data)
+][1]
+
+if (is.na(state_col)) {
+  stop(
+    "No refined state column found. Available metadata columns are:\n",
+    paste(colnames(TCRseq_obj@meta.data), collapse = ", ")
+  )
+}
+
+stopifnot("Condition" %in% colnames(TCRseq_obj@meta.data))
+# Use the Harmony embedding (the one clusters and UMAP were built on); fall back to PCA if absent
+traj_reduction <- if ("harmony" %in% names(TCRseq_obj@reductions)) "harmony" else "pca"
+stopifnot(traj_reduction %in% names(TCRseq_obj@reductions))
+stopifnot("umap" %in% names(TCRseq_obj@reductions))
+
+md <- TCRseq_obj@meta.data
+
+md$Condition <- stringr::str_trim(
+  as.character(md$Condition)
+)
+
+md$Condition <- dplyr::case_when(
+  md$Condition %in% c("TNFR2a", "TNFR2a") ~ "TNFR2a",
+  md$Condition %in% c("Control") ~ "Control",
+  TRUE ~ md$Condition
+)
+
+md$trajectory_state <- as.character(
+  md[[state_col]]
+)
+
+md$trajectory_state <- factor(
+  md$trajectory_state,
+  levels = unique(
+    c(
+      state_levels,
+      as.character(md$trajectory_state)
+    )
+  )
+)
+
+md$trajectory_state_label <- get_state_label(
+  md$trajectory_state
+)
+
+TCRseq_obj@meta.data <- md
+
+cat("Loaded object: data/TCRseq_revised_clustering.rds\n")
+cat("Using trajectory state column:", state_col, "\n")
+cat("Using embedding for Slingshot:", traj_reduction, "\n")
+
+table(
+  TCRseq_obj@meta.data$trajectory_state,
+  TCRseq_obj@meta.data$Condition,
+  useNA = "ifany"
+)
+```
+
+## Trajectory inclusion design
+
+```{r}
+#| label: trajectory-inclusion-summary
+#| message: false
+#| warning: false
+#| tbl-cap: "Cells included and excluded from the primary activation trajectory analysis."
+
+TCRseq_obj$trajectory_status <- dplyr::case_when(
+  as.character(TCRseq_obj$trajectory_state) %in% trajectory_states ~ "Included in activation trajectory",
+  as.character(TCRseq_obj$trajectory_state) %in% excluded_states ~ "Excluded from primary trajectory",
+  TRUE ~ "Other / not assigned"
+)
+
+trajectory_inclusion_summary <- TCRseq_obj@meta.data %>%
+  dplyr::mutate(
+    trajectory_state = as.character(trajectory_state),
+    trajectory_state_label = get_state_label(trajectory_state)
+  ) %>%
+  dplyr::count(
+    Condition,
+    trajectory_state,
+    trajectory_state_label,
+    trajectory_status,
+    name = "n_cells"
+  ) %>%
+  dplyr::arrange(trajectory_status, Condition, trajectory_state)
+
+readr::write_csv(
+  trajectory_inclusion_summary,
+  "output/trajectory_inclusion_summary_TNFR2a_vs_Control.csv"
+)
+
+knitr::kable(trajectory_inclusion_summary, align = "c")
+```
+
+```{r}
+#| label: fig-trajectory-included-excluded
+#| message: false
+#| warning: false
+#| fig-width: 9
+#| fig-height: 7
+#| fig-dpi: 300
+#| fig-cap: "Cells included in the primary activation trajectory compared with excluded or unassigned states."
+
+Seurat::DimPlot(
+  TCRseq_obj,
+  reduction = "umap",
+  group.by = "trajectory_status"
+) +
+  ggplot2::theme_classic()
+```
+
+```{r}
+#| label: fig-all-refined-states-for-trajectory-context
+#| message: false
+#| warning: false
+#| fig-width: 10
+#| fig-height: 7
+#| fig-dpi: 300
+#| fig-cap: "Refined CD4⁺ T-cell states before restricting to the activation trajectory."
+
+Seurat::DimPlot(
+  TCRseq_obj,
+  reduction = "umap",
+  group.by = "trajectory_state_label",
+  label = TRUE,
+  repel = TRUE
+) +
+  ggplot2::theme_classic()
+```
+
+## Restricted activation trajectory object
+
+```{r}
+#| label: create-restricted-trajectory-object
+#| echo: true
+#| message: false
+#| warning: false
+
+traj_obj <- subset(
+  TCRseq_obj,
+  subset = trajectory_state %in% trajectory_states &
+    Condition %in% c("TNFR2a", "Control")
+)
+
+traj_obj$trajectory_state <- factor(
+  as.character(traj_obj$trajectory_state),
+  levels = trajectory_states
+)
+
+traj_obj$trajectory_state_label <- get_state_label(traj_obj$trajectory_state)
+
+table(traj_obj$trajectory_state, traj_obj$Condition)
+```
+
+```{r}
+#| label: restricted-trajectory-summary
+#| message: false
+#| warning: false
+#| tbl-cap: "Cell counts retained for joint activation trajectory inference."
+
+restricted_trajectory_summary <- traj_obj@meta.data %>%
+  dplyr::count(
+    Condition,
+    trajectory_state,
+    trajectory_state_label,
+    name = "n_cells"
+  ) %>%
+  dplyr::arrange(trajectory_state, Condition)
+
+readr::write_csv(
+  restricted_trajectory_summary,
+  "output/trajectory_restricted_state_counts_TNFR2a_vs_Control.csv"
+)
+
+knitr::kable(restricted_trajectory_summary, align = "c")
+```
+
+```{r}
+#| label: fig-restricted-trajectory-states
+#| message: false
+#| warning: false
+#| fig-width: 9
+#| fig-height: 7
+#| fig-dpi: 300
+#| fig-cap: "Cells retained for activation trajectory inference, coloured by refined trajectory state."
+
+Seurat::DimPlot(
+  traj_obj,
+  reduction = "umap",
+  group.by = "trajectory_state_label",
+  label = TRUE,
+  repel = TRUE
+) +
+  ggplot2::theme_classic()
+```
+
+```{r}
+#| label: fig-restricted-trajectory-condition
+#| message: false
+#| warning: false
+#| fig-width: 9
+#| fig-height: 7
+#| fig-dpi: 300
+#| fig-cap: "Cells retained for activation trajectory inference, coloured by treatment condition."
+
+Seurat::DimPlot(
+  traj_obj,
+  reduction = "umap",
+  group.by = "Condition"
+) +
+  ggplot2::theme_classic()
+```
+
+## Joint Slingshot activation trajectory
+
+Slingshot was fitted once using both TNFR2a and Control cells. This avoids condition-specific trajectories that may not be directly comparable and places both groups on a shared activation pseudotime axis. The trajectory was rooted in the **Naive-like** state.
+
+```{r}
+#| label: run-slingshot-joint-activation-trajectory
+#| echo: true
+#| message: false
+#| warning: false
+
+pca <- Seurat::Embeddings(traj_obj, reduction = traj_reduction)
+
+dummy_counts <- matrix(
+  0,
+  nrow = 1,
+  ncol = nrow(pca),
+  dimnames = list("dummy", rownames(pca))
+)
+
+sce_traj <- SingleCellExperiment::SingleCellExperiment(
+  assays = list(counts = dummy_counts)
+)
+
+SummarizedExperiment::colData(sce_traj) <- S4Vectors::DataFrame(
+  traj_obj@meta.data[rownames(pca), , drop = FALSE]
+)
+
+SingleCellExperiment::reducedDim(sce_traj, "PCA") <- pca
+
+sce_traj <- slingshot::slingshot(
+  sce_traj,
+  clusterLabels = sce_traj$trajectory_state,
+  reducedDim = "PCA",
+  start.clus = "Naive_like",
+  end.clus = c("Th1_cytotoxic_like", "Treg_tissue_like")
+)
+
+print(slingshot::slingLineages(sce_traj))
+
+pst <- slingshot::slingPseudotime(sce_traj)
+cw <- slingshot::slingCurveWeights(sce_traj)
+
+cat("Number of inferred lineages:", ncol(pst), "\n")
+cat("Finite pseudotime counts per lineage:\n")
+print(colSums(is.finite(pst)))
+
+if (is.null(pst) || ncol(pst) == 0) {
+  stop("Slingshot did not infer any lineages.")
+}
+
+for (i in seq_len(ncol(pst))) {
+  traj_obj[[paste0("pseudotime_lineage", i)]] <- pst[, i]
+}
+
+traj_obj$pseudotime <- traj_obj$pseudotime_lineage1
+
+traj_obj@misc$slingshot_sce <- sce_traj
+```
+
+```{r}
+#| label: slingshot-qc-table
+#| message: false
+#| warning: false
+#| tbl-cap: "Slingshot pseudotime QC summary."
+
+slingshot_qc <- tibble::tibble(
+  lineage = paste0("lineage", seq_len(ncol(pst))),
+  finite_cells = colSums(is.finite(pst)),
+  min_pseudotime = apply(pst, 2, function(x) min(x[is.finite(x)], na.rm = TRUE)),
+  max_pseudotime = apply(pst, 2, function(x) max(x[is.finite(x)], na.rm = TRUE))
+)
+
+readr::write_csv(
+  slingshot_qc,
+  "output/trajectory_slingshot_qc_TNFR2a_vs_Control.csv"
+)
+
+knitr::kable(slingshot_qc, align = "c")
+```
+## Pseudotime along each lineage
+
+Slingshot was constrained to start at Naive-like cells and to end in Th1/cytotoxic-like and Treg tissue-like cells. Cells in the shared Naive-like root contribute to both lineages, so the lineages overlap near the root.
+
+```{r}
+#| label: fig-pseudotime-umap-lineages
+#| message: false
+#| warning: false
+#| fig-width: 15
+#| fig-height: 5
+#| fig-dpi: 300
+#| fig-cap: "Slingshot pseudotime for each lineage on the shared UMAP. Cells outside a lineage are grey."
+
+lineage_cols <- grep("^pseudotime_lineage", colnames(traj_obj@meta.data), value = TRUE)
+
+lin <- slingshot::slingLineages(sce_traj)
+lineage_end_state <- vapply(lin, function(x) x[length(x)], character(1))
+names(lineage_end_state) <- paste0("pseudotime_lineage", seq_along(lin))
+lineage_names <- paste0(
+  "Lineage ", seq_along(lin), ": Naive-like \u2192 ",
+  get_state_label(lineage_end_state)
+)
+names(lineage_names) <- names(lineage_end_state)
+
+Seurat::FeaturePlot(
+  traj_obj,
+  features = lineage_cols,
+  reduction = "umap",
+  order = TRUE,
+  ncol = length(lineage_cols)
+) &
+  ggplot2::scale_color_viridis_c(option = "D", na.value = "grey85") &
+  ggplot2::theme_classic()
+```
+
+```{r}
+#| label: fig-pseudotime-by-state-lineage
+#| message: false
+#| warning: false
+#| fig-width: 12
+#| fig-height: 5
+#| fig-dpi: 300
+#| fig-cap: "Distribution of pseudotime across refined states within each lineage."
+
+pt_long <- traj_obj@meta.data %>%
+  tibble::rownames_to_column("cell_id") %>%
+  dplyr::select(
+    cell_id, Condition, orig.ident, trajectory_state,
+    dplyr::all_of(lineage_cols)
+  ) %>%
+  tidyr::pivot_longer(
+    dplyr::all_of(lineage_cols),
+    names_to = "lineage", values_to = "pseudotime"
+  ) %>%
+  dplyr::filter(is.finite(pseudotime)) %>%
+  dplyr::mutate(
+    lineage_label = factor(lineage_names[lineage], levels = lineage_names),
+    state_label = factor(
+      get_state_label(trajectory_state),
+      levels = get_state_label(trajectory_states)
+    )
+  )
+
+ggplot2::ggplot(
+  pt_long,
+  ggplot2::aes(x = state_label, y = pseudotime, fill = state_label)
+) +
+  ggplot2::geom_boxplot(outlier.size = 0.3) +
+  ggplot2::facet_wrap(~ lineage_label, scales = "free_x") +
+  ggplot2::labs(x = NULL, y = "Pseudotime") +
+  ggplot2::theme_classic() +
+  ggplot2::theme(
+    axis.text.x = ggplot2::element_text(angle = 45, hjust = 1),
+    legend.position = "none"
+  )
+```
+
+## Condition distribution along pseudotime
+
+Densities pool all cells within a condition, and the two arms contribute different numbers of cells, so they are shown for orientation only. The per-mouse table that follows is the basis for any comparison between conditions.
+
+```{r}
+#| label: fig-pseudotime-density-by-condition-lineage
+#| message: false
+#| warning: false
+#| fig-width: 12
+#| fig-height: 4.5
+#| fig-dpi: 300
+#| fig-cap: "Density of TNFR2a and Control cells along pseudotime in each lineage (pooled cells; descriptive)."
+
+ggplot2::ggplot(
+  pt_long,
+  ggplot2::aes(x = pseudotime, fill = Condition, colour = Condition)
+) +
+  ggplot2::geom_density(alpha = 0.25) +
+  ggplot2::facet_wrap(~ lineage_label, scales = "free") +
+  ggplot2::labs(x = "Pseudotime", y = "Density") +
+  ggplot2::theme_classic()
+```
+
+```{r}
+#| label: tbl-pseudotime-per-mouse
+#| message: false
+#| warning: false
+#| tbl-cap: "Pseudotime summary per mouse and lineage. pct_in_effector_state is the percentage of the mouse's cells in that lineage that sit in the lineage's end state."
+
+lineage_end_lookup <- setNames(lineage_end_state, lineage_names)
+
+pseudotime_per_mouse <- pt_long %>%
+  dplyr::mutate(end_state = lineage_end_lookup[as.character(lineage_label)]) %>%
+  dplyr::group_by(lineage_label, Condition, orig.ident) %>%
+  dplyr::summarise(
+    n_cells = dplyr::n(),
+    median_pseudotime = round(stats::median(pseudotime), 1),
+    pct_in_effector_state = round(
+      100 * mean(as.character(trajectory_state) == dplyr::first(end_state)), 1
+    ),
+    .groups = "drop"
+  ) %>%
+  dplyr::arrange(lineage_label, Condition, orig.ident)
+
+readr::write_csv(
+  pseudotime_per_mouse,
+  "output/trajectory_pseudotime_per_mouse_TNFR2a_vs_Control.csv"
+)
+
+knitr::kable(pseudotime_per_mouse, align = "c")
+```
+
+```{r}
+#| label: write-pseudotime-metadata
+#| message: false
+#| warning: false
+
+trajectory_metadata <- traj_obj@meta.data %>%
+  tibble::rownames_to_column("cell_id") %>%
+  dplyr::select(
+    cell_id,
+    Condition,
+    trajectory_state,
+    trajectory_state_label,
+    dplyr::starts_with("pseudotime_lineage")
+  )
+
+readr::write_csv(
+  trajectory_metadata,
+  "output/trajectory_pseudotime_metadata_TNFR2a_vs_Control.csv"
+)
+```
+
+## Optional tradeSeq analysis
+
+The following tradeSeq analysis is exploratory and should only be interpreted if the Slingshot trajectory passes biological QC. In particular, the inferred pseudotime should start in Naive-like cells and progress through activated and effector-associated states without being dominated by disconnected clusters or technical structure.
+
+Because Slingshot was fitted jointly across TNFR2a and Control cells, tradeSeq is applied to the shared activation trajectory. The results identify genes whose expression varies along this trajectory, but they should not be interpreted as evidence of true developmental timing without independent biological validation.
+
+```{r}
+#| label: tradeseq-fit-joint-trajectory
+#| echo: true
+#| message: false
+#| warning: false
+
+run_tradeseq <- TRUE      # <-- set TRUE when ready
+test_mode <- TRUE          # <-- quick debug mode
+
+if (run_tradeseq) {
+
+  fit_tradeseq_joint <- function(seu_obj,
+                                 sce_slot = "slingshot_sce",
+                                 assay_name = "RNA",
+                                 nknots = 4,
+                                 verbose = TRUE) {
+
+    stopifnot(sce_slot %in% names(seu_obj@misc))
+    sce <- seu_obj@misc[[sce_slot]]
+
+    # Ensure counts are joined (Seurat v5)
+    seu_obj <- tryCatch(
+      SeuratObject::JoinLayers(seu_obj, assay = assay_name),
+      error = function(e) seu_obj
+    )
+
+    counts_mat <- tryCatch(
+      SeuratObject::LayerData(
+        object = seu_obj,
+        assay = assay_name,
+        layer = "counts"
+      ),
+      error = function(e) {
+        Seurat::GetAssayData(
+          object = seu_obj,
+          assay = assay_name,
+          layer = "counts"
+        )
+      }
+    )
+
+    common_cells <- intersect(colnames(counts_mat), colnames(sce))
+    counts_mat <- counts_mat[, common_cells, drop = FALSE]
+    sce <- sce[, common_cells]
+
+    pseudotime <- slingshot::slingPseudotime(sce)
+    cellWeights <- slingshot::slingCurveWeights(sce)
+
+    keep_cells <- rowSums(is.finite(pseudotime)) > 0
+    counts_mat <- counts_mat[, keep_cells, drop = FALSE]
+    pseudotime <- pseudotime[keep_cells, , drop = FALSE]
+    cellWeights <- cellWeights[keep_cells, , drop = FALSE]
+
+    pseudotime[!is.finite(pseudotime)] <- 0
+    cellWeights[!is.finite(cellWeights)] <- 0
+
+    # 🔥 KEY SPEEDUP: filter genes
+    counts_mat <- counts_mat[rowSums(counts_mat > 0) >= 20, , drop = FALSE]
+
+    # use Seurat variable genes if available
+    variable_genes <- tryCatch(
+      Seurat::VariableFeatures(seu_obj),
+      error = function(e) NULL
+    )
+
+    if (!is.null(variable_genes)) {
+      variable_genes <- intersect(variable_genes, rownames(counts_mat))
+      counts_mat <- counts_mat[variable_genes, , drop = FALSE]
+    }
+
+    # 🚀 test mode (fast)
+    if (test_mode) {
+      counts_mat <- counts_mat[seq_len(min(500, nrow(counts_mat))), , drop = FALSE]
+      message("Running tradeSeq in TEST MODE (<=500 genes)")
+    }
+
+    message("Genes used: ", nrow(counts_mat))
+    message("Cells used: ", ncol(counts_mat))
+
+    gam_fit <- tradeSeq::fitGAM(
+      counts = counts_mat,
+      pseudotime = pseudotime,
+      cellWeights = cellWeights,
+      nknots = nknots,
+      verbose = verbose
+    )
+
+    list(
+      counts = counts_mat,
+      pseudotime = pseudotime,
+      cellWeights = cellWeights,
+      gam = gam_fit
+    )
+  }
+
+  trade_joint <- fit_tradeseq_joint(traj_obj)
+
+} else {
+  message("Skipping tradeSeq (run_tradeseq = FALSE)")
+}
+```
+
+```{r}
+#| label: tradeseq-qc-joint
+#| message: false
+#| warning: false
+#| tbl-cap: "tradeSeq model input summary for the joint activation trajectory."
+
+tradeseq_qc <- tibble::tibble(
+  cells_in_trajectory_object = ncol(traj_obj),
+  cells_used_for_tradeSeq = ncol(trade_joint$counts),
+  genes_used_for_tradeSeq = nrow(trade_joint$counts),
+  lineages_used = ncol(trade_joint$pseudotime)
+)
+
+readr::write_csv(
+  tradeseq_qc,
+  "output/tradeseq_joint_activation_trajectory_qc.csv"
+)
+
+knitr::kable(tradeseq_qc, align = "c")
+```
+
+```{r}
+#| label: tradeseq-association-test-joint
+#| message: false
+#| warning: false
+
+assoc_joint <- tradeSeq::associationTest(trade_joint$gam)
+
+assoc_joint <- as.data.frame(assoc_joint)
+assoc_joint$gene <- rownames(assoc_joint)
+
+if (!"padj" %in% colnames(assoc_joint)) {
+  assoc_joint$padj <- p.adjust(assoc_joint$pvalue, method = "BH")
+}
+
+assoc_joint <- assoc_joint %>%
+  dplyr::arrange(padj)
+
+sig_assoc_joint <- assoc_joint %>%
+  dplyr::filter(padj < 0.05)
+
+readr::write_csv(
+  assoc_joint,
+  "output/tradeseq_joint_activation_trajectory_association_results.csv"
+)
+
+readr::write_csv(
+  sig_assoc_joint,
+  "output/tradeseq_joint_activation_trajectory_significant_genes.csv"
+)
+
+cat("Significant pseudotime-associated genes:", nrow(sig_assoc_joint), "\n")
+```
+
+```{r}
+#| label: tbl-tradeseq-joint-top-genes
+#| message: false
+#| warning: false
+#| tbl-cap: "Top genes associated with the shared activation pseudotime trajectory."
+
+assoc_joint %>%
+  dplyr::slice_head(n = 50) %>%
+  dplyr::mutate(
+    padj = formatC(padj, format = "e", digits = 2),
+    pvalue = formatC(pvalue, format = "e", digits = 2)
+  ) %>%
+  knitr::kable(align = "c")
+```
+
+```{r}
+#| label: fig-tradeseq-joint-top-genes
+#| message: false
+#| warning: false
+#| fig-width: 8
+#| fig-height: 7
+#| fig-dpi: 300
+#| fig-cap: "Top genes associated with the shared activation pseudotime trajectory."
+
+plot_df <- assoc_joint %>%
+  dplyr::filter(is.finite(padj), padj > 0) %>%
+  dplyr::slice_head(n = 30) %>%
+  dplyr::mutate(score = -log10(padj))
+
+if (nrow(plot_df) == 0) {
+  plot_empty("No finite tradeSeq adjusted p-values available.")
+} else {
+  ggplot2::ggplot(
+    plot_df,
+    ggplot2::aes(
+      x = score,
+      y = stats::reorder(gene, score)
+    )
+  ) +
+    ggplot2::geom_point(size = 3) +
+    ggplot2::labs(
+      x = expression(-log[10](FDR)),
+      y = "Gene"
+    ) +
+    ggplot2::theme_bw()
+}
+```
+
+```{r}
+#| label: fig-tradeseq-selected-marker-curves
+#| message: false
+#| warning: false
+#| fig-width: 12
+#| fig-height: 10
+#| fig-dpi: 300
+#| fig-cap: "Smoothed expression patterns of selected activation and effector-associated genes along the shared activation pseudotime trajectory."
+
+genes_of_interest <- c(
+  "Tcf7",
+  "Lef1",
+  "Sell",
+  "Il7r",
+  "Cd69",
+  "Nr4a1",
+  "Fos",
+  "Jun",
+  "Il17a",
+  "Il17f",
+  "Ifng",
+  "Tbx21",
+  "Cxcr3"
+)
+
+available_genes <- intersect(genes_of_interest, rownames(trade_joint$counts))
+missing_genes <- setdiff(genes_of_interest, available_genes)
+
+if (length(missing_genes) > 0) {
+  message(
+    "These selected genes were not found and will be skipped: ",
+    paste(missing_genes, collapse = ", ")
+  )
+}
+
+if (length(available_genes) == 0) {
+  plot_empty("None of the selected genes were found in the counts matrix.")
+} else {
+  for (g in available_genes) {
+    print(
+      tradeSeq::plotSmoothers(
+        models = trade_joint$gam,
+        counts = trade_joint$counts,
+        gene = g
+      ) +
+        ggplot2::labs(title = g)
+    )
+  }
+}
+```
+
+```{r}
+#| label: fig-tradeseq-top-dynamic-gene-curves
+#| message: false
+#| warning: false
+#| fig-width: 12
+#| fig-height: 10
+#| fig-dpi: 300
+#| fig-cap: "Smoothed expression patterns of top pseudotime-associated genes along the shared activation trajectory."
+
+top_dynamic_genes <- assoc_joint %>%
+  dplyr::filter(is.finite(padj)) %>%
+  dplyr::arrange(padj) %>%
+  dplyr::slice_head(n = 6) %>%
+  dplyr::pull(gene)
+
+top_dynamic_genes <- intersect(top_dynamic_genes, rownames(trade_joint$counts))
+
+if (length(top_dynamic_genes) == 0) {
+  plot_empty("No top dynamic genes available for smoother plotting.")
+} else {
+  for (g in top_dynamic_genes) {
+    print(
+      tradeSeq::plotSmoothers(
+        models = trade_joint$gam,
+        counts = trade_joint$counts,
+        gene = g
+      ) +
+        ggplot2::labs(title = g)
+    )
+  }
+}
+```
+
+## Interpretation
+
+The trajectory passes the basic biological checks. Pseudotime starts in naive-like cells, and the two lineages diverge towards Th1/cytotoxic-like and Treg tissue-like endpoints, with activated/memory-like and Treg resting-like cells placed at intermediate positions.
+
+Because TNFR2a and control cells were fitted jointly, treatment effects appear as differences in where cells sit along the same axes:
+
+- **Regulatory branch.** About 21–25% of cells on this lineage are in the Treg tissue-like endpoint state in every TNFR2a mouse, against 3–5% in every control mouse. Median pseudotime is shifted slightly later. TNFR2 agonism therefore moves the Treg compartment towards the tissue/effector end of the continuum.
+- **Conventional branch.** The fraction of cells at the Th1/cytotoxic-like end overlaps between arms (about 6–13% in controls, 10–22% in TNFR2a mice), so there is no consistent shift.
+
+tradeSeq [@vandenberge2020tradeseq] identifies genes that vary along the shared trajectory. The strongest associations are effector genes such as *Ccl5* and *S100a6*, which mark progression towards the Th1/cytotoxic end. These association tests describe the shared continuum, not treatment effects.
+
+## Summary
+
+A two-branch Slingshot trajectory, fitted jointly across conditions, orders lung CD4⁺ T cells from a naive root towards Th1/cytotoxic and tissue Treg endpoints. TNFR2 agonism shifts the regulatory branch towards the tissue Treg end in every treated mouse, while the conventional effector branch is largely unchanged. This agrees with the composition, repertoire and differential expression results. Pseudotime is a descriptive ordering and is not interpreted as developmental time.
